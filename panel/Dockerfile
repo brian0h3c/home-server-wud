@@ -1,6 +1,6 @@
 # tiny control panel: docker CLI + compose plugin + python stdlib (no pip deps)
 FROM docker:27-cli
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 bash tar
 WORKDIR /app
 COPY app.py /app/app.py
 EXPOSE 8080
