@@ -1,0 +1,21 @@
+services:
+  # What's Up Docker — dashboard to SEE and one-click TRIGGER container image updates.
+  # UI: http://<host>:${WUD_PORT}
+  wud:
+    image: getwud/wud:latest
+    container_name: wud
+    ports:
+      - "${WUD_PORT:-4012}:3000"
+    volumes:
+      # read to watch containers; write so the one-click "Update" button can recreate them
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=${TZ:-UTC}
+      # scan every 6h by default (6-field cron: sec min hour dom mon dow)
+      - WUD_WATCHER_LOCAL_CRON=${WUD_CRON:-0 0 */6 * * *}
+      - WUD_WATCHER_LOCAL_WATCHBYDEFAULT=true
+      - WUD_WATCHER_LOCAL_WATCHDIGEST=true
+      # MANUAL update button in the UI — nothing updates on its own
+      - WUD_TRIGGER_DOCKER_LOCAL_MODE=manual
+      - WUD_TRIGGER_DOCKER_LOCAL_PRUNE=true
+    restart: unless-stopped

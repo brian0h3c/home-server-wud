@@ -1,0 +1,6 @@
+# local config & generated data — never commit
+.env
+backups/
+logs/
+*.tar.gz
+*.log
