@@ -31,7 +31,7 @@ BACKUP_DIR="${BACKUP_DIR:-$REPO_DIR/backups}"
 KEEP="${KEEP:-7}"
 DEST_DIR="${DEST_DIR:-}"
 EXTRA_PATHS="${EXTRA_PATHS:-}"
-DEFAULT_EXCLUDES="*/Media */media */Movies */movies */TVShows */tv */Downloads */downloads */transcode */Transcode */Cache */Metadata */MediaCover *.sock *.log node_modules backups logs"
+DEFAULT_EXCLUDES="*/Media */media */Movies */movies */TVShows */tv */Downloads */downloads */transcode */Transcode */Cache */Caches */Metadata */MediaCover */Crash* */Diagnostics *.db-20* *.sock *.log node_modules backups logs"
 EXCLUDES="${EXCLUDES:-$DEFAULT_EXCLUDES}"
 
 if [ "${1:-}" = "--list" ]; then
