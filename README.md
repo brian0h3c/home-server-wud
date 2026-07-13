@@ -39,6 +39,21 @@ which have a newer image. Each one gets a manual **Update** button.
 > Tip: for a home LAN, bind the port to your LAN IP so it isn't exposed —
 > set `WUD_PORT=192.168.1.10:4012` style by editing `docker-compose.yml`.
 
+## Control panel (Backup now / Update buttons)
+
+A second small UI at **http://<your-server-ip>:4013** gives you buttons:
+
+- **Backup now** — runs a full-stack backup (see below)
+- **Update** — per container: **backs up, then pulls + recreates** it
+- Live view of which containers have updates + the OS update count
+
+Point `PROJECT_DIR` in `.env` at your stack (e.g. `/home/me/docker`) — it's
+mounted at the same path inside the panel so `docker compose` resolves your
+bind-mount paths correctly. Set `PANEL_TOKEN` to require `?token=...`.
+
+> ⚠️ The panel executes Docker operations — keep it on your LAN, never expose it
+> to the internet.
+
 ---
 
 ## Safe updates with automatic backup
