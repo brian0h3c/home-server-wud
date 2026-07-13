@@ -13,7 +13,9 @@
 #
 # Usage:
 #   ./scripts/update.sh <container> [<container> ...]
-#   ./scripts/update.sh --list                 # list running containers
+#   ./scripts/update.sh --full <container> ...  # ALSO snapshot the whole stack
+#                                               # (backup.sh) before updating
+#   ./scripts/update.sh --list                  # list running containers
 #
 # Environment overrides:
 #   COMPOSE_FILE   docker-compose.yml that manages the container(s)
@@ -49,7 +51,17 @@ if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
 
-[ $# -ge 1 ] || { echo "usage: $0 <container> [<container> ...]   (or --list)"; exit 1; }
+# optional: full-stack snapshot before updating anything
+FULL=0
+if [ "${1:-}" = "--full" ]; then FULL=1; shift; fi
+
+[ $# -ge 1 ] || { echo "usage: $0 [--full] <container> [<container> ...]   (or --list)"; exit 1; }
+
+if [ "$FULL" = "1" ]; then
+  echo "== full-stack backup (backup.sh) =="
+  "$(dirname "$0")/backup.sh" || { echo "  [!] full backup failed — aborting"; exit 1; }
+  echo
+fi
 
 backup_container() {
   local name="$1"

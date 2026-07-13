@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 #
-# setup-cron.sh — install a daily cron job that logs available OS updates.
-# Runs as the current user (no sudo). Default time: 07:00 daily.
+# setup-cron.sh — install cron jobs (as the current user, no sudo):
+#   * daily OS update check     (default 07:00)
+#   * daily full-stack backup   (default 03:30)  -- disable with NO_BACKUP=1
 #
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-HOUR="${1:-7}"   # optional: pass an hour 0-23 (default 7)
+OS_HOUR="${1:-7}"          # OS check hour (0-23)
+BK="${BACKUP_TIME:-30 3}"  # backup "minute hour" (default 03:30)
 
-line="0 $HOUR * * * $DIR/os-update-check.sh >/dev/null 2>&1"
-( crontab -l 2>/dev/null | grep -v "os-update-check.sh"; echo "$line" ) | crontab -
-echo "installed cron: $line"
-echo "current crontab:"; crontab -l | grep os-update-check.sh
+os_line="0 $OS_HOUR * * * $DIR/os-update-check.sh >/dev/null 2>&1"
+bk_line="$BK * * * $DIR/backup.sh >/dev/null 2>&1"
+
+tmp="$(crontab -l 2>/dev/null | grep -v -e 'os-update-check.sh' -e 'backup.sh' || true)"
+{
+  echo "$tmp"
+  echo "$os_line"
+  [ "${NO_BACKUP:-0}" = "1" ] || echo "$bk_line"
+} | grep -v '^$' | crontab -
+
+echo "installed cron jobs:"
+crontab -l | grep -E 'os-update-check.sh|backup.sh'
