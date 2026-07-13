@@ -57,8 +57,16 @@ echo "  project : $PROJECT_DIR"
 echo "  archive : $out"
 
 # absolute paths (tar strips the leading /, restore with -C /)
-tar -czf "$out" "${exargs[@]}" "$PROJECT_DIR" "${extra[@]}" 2>/dev/null || {
-  echo "[!] backup failed"; rm -f "$out"; exit 1; }
+# tar exit 1 = benign warnings (files changed / unreadable while archiving);
+# only >=2 is a real failure.
+set +e
+tar -czf "$out" "${exargs[@]}" "$PROJECT_DIR" "${extra[@]}" 2>/dev/null
+rc=$?
+set -e
+if [ "$rc" -gt 1 ]; then
+  echo "[!] backup failed (tar exit $rc)"; rm -f "$out"; exit 1
+fi
+[ "$rc" -eq 1 ] && echo "  (note: some files were skipped or changed during backup — normal for live configs)"
 echo "  size    : $(du -h "$out" | cut -f1)"
 
 # rotate local
