@@ -19,3 +19,30 @@ services:
       - WUD_TRIGGER_DOCKER_LOCAL_MODE=manual
       - WUD_TRIGGER_DOCKER_LOCAL_PRUNE=true
     restart: unless-stopped
+
+  # Control panel — dashboard with "Backup now" / "Update" buttons.
+  # UI: http://<host>:${PANEL_PORT}
+  # PROJECT_DIR must be mounted at the SAME path inside the container so that
+  # `docker compose` resolves the stack's relative bind-mount paths correctly.
+  panel:
+    build: ./panel
+    container_name: hsw-panel
+    ports:
+      - "${PANEL_PORT:-4013}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/app/scripts:ro
+      - ./logs:/app/logs
+      - ${PROJECT_DIR:-./}:${PROJECT_DIR:-/project}
+    environment:
+      - TZ=${TZ:-UTC}
+      - WUD_URL=http://wud:3000
+      - PROJECT_DIR=${PROJECT_DIR:-/project}
+      - COMPOSE_FILE=${COMPOSE_FILE:-${PROJECT_DIR:-/project}/docker-compose.yml}
+      - BACKUP_DIR=${PROJECT_DIR:-/project}/backups
+      - OS_SNAPSHOT=/app/logs/os-updates-latest.txt
+      # set a token to require ?token=... on the panel (recommended)
+      - PANEL_TOKEN=${PANEL_TOKEN:-}
+    depends_on:
+      - wud
+    restart: unless-stopped
