@@ -2,27 +2,32 @@
 """
 home-server-wud control panel — a tiny, dependency-free web UI to:
   * see running containers + which have image updates (via WUD's API)
-  * see available OS updates
-  * click "Backup now"  -> runs scripts/backup.sh
-  * click "Update"      -> runs scripts/update.sh <container> (backup, then update)
+  * see available OS updates (+ reboot-required)
+  * "Full backup"  -> runs scripts/backup.sh
+  * "Update OS"    -> requests a host-side apt full-upgrade (writes a flag file;
+                      a root cron running scripts/os-update-runner.sh applies it)
+  * per-container "Update" -> scripts/update.sh <name> (backup, then update)
 
-Security: bind to your LAN only (compose port mapping), and optionally set
-PANEL_TOKEN to require a token. Container names are validated against the live
-`docker ps` list and passed as argv (no shell), so there's no command injection.
+Security: bind to your LAN only, optionally set PANEL_TOKEN. Container names are
+validated against the live `docker ps` list and passed as argv (no shell).
 """
 import json
 import os
 import subprocess
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 WUD_URL = os.environ.get("WUD_URL", "http://wud:3000")
 SCRIPTS = os.environ.get("SCRIPTS_DIR", "/app/scripts")
-OS_SNAP = os.environ.get("OS_SNAPSHOT", "/app/logs/os-updates-latest.txt")
+LOGDIR = os.environ.get("LOG_DIR", "/app/logs")
+OS_SNAP = os.environ.get("OS_SNAPSHOT", os.path.join(LOGDIR, "os-updates-latest.txt"))
+OS_RUNLOG = os.environ.get("OS_RUNLOG", os.path.join(LOGDIR, "os-update-run.log"))
+OS_FLAG = os.environ.get("OS_UPDATE_FLAG", os.path.join(LOGDIR, ".os-update-request"))
 TOKEN = os.environ.get("PANEL_TOKEN", "")
 PORT = int(os.environ.get("PANEL_PORT", "8080"))
-ENV = os.environ.copy()  # backup.sh/update.sh inherit PROJECT_DIR/BACKUP_DIR/COMPOSE_FILE
+ENV = os.environ.copy()
 
 
 def sh(args, timeout=3600):
@@ -52,74 +57,172 @@ def wud_updates():
         return {}
 
 
-def os_snapshot():
+def _read(path, tail=0):
     try:
-        with open(OS_SNAP, encoding="utf-8") as f:
-            return f.read()
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = f.read()
+        if tail:
+            data = "\n".join(data.splitlines()[-tail:])
+        return data
     except Exception:  # noqa: BLE001
-        return "OS update snapshot not available yet (run scripts/os-update-check.sh)."
+        return ""
 
 
-PAGE = """<!doctype html><html><head><meta charset=utf-8>
-<title>home-server-wud panel</title>
+def os_info():
+    snap = _read(OS_SNAP)
+    count, security, reboot = 0, 0, False
+    for line in snap.splitlines():
+        if line.startswith("updates_available="):
+            for tok in line.split():
+                if tok.startswith("updates_available="):
+                    count = int(tok.split("=", 1)[1] or 0)
+                if tok.startswith("security="):
+                    security = int(tok.split("=", 1)[1] or 0)
+        if "REBOOT REQUIRED" in line:
+            reboot = True
+    return {
+        "count": count, "security": security, "reboot": reboot,
+        "snapshot": snap or "No snapshot yet.",
+        "runlog": _read(OS_RUNLOG, tail=40),
+        "pending": os.path.exists(OS_FLAG),
+    }
+
+
+PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
+<title>Home Server Panel</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
- body{font-family:system-ui,Arial,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}
- header{padding:16px 20px;background:#171a21;border-bottom:1px solid #2a2f3a}
- h1{margin:0;font-size:18px} .wrap{padding:20px;max-width:900px;margin:0 auto}
- table{width:100%;border-collapse:collapse;margin-top:8px}
- th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #232833;font-size:14px}
- .up{color:#f0b429;font-weight:600}.ok{color:#6bbf59}
- button{background:#2d6cdf;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
- button.gray{background:#3a4150}.bar{display:flex;gap:10px;align-items:center;margin:6px 0 14px}
- pre{background:#0b0d11;border:1px solid #232833;border-radius:8px;padding:12px;white-space:pre-wrap;max-height:340px;overflow:auto;font-size:12px}
- .card{background:#141821;border:1px solid #232833;border-radius:10px;padding:14px;margin-bottom:16px}
- small{color:#8a93a6}
+ :root{--bg:#0e1116;--card:#161b24;--line:#232a36;--txt:#e8eaed;--mut:#93a0b4;
+   --accent:#3b82f6;--green:#22c55e;--amber:#f59e0b;--red:#ef4444}
+ *{box-sizing:border-box}
+ body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;margin:0;background:var(--bg);color:var(--txt)}
+ header{padding:16px 22px;background:linear-gradient(90deg,#12161d,#171d27);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+ header h1{margin:0;font-size:17px;font-weight:600}
+ .pill{font-size:12px;padding:3px 9px;border-radius:999px;background:#1f2734;color:var(--mut)}
+ .wrap{padding:22px;max-width:940px;margin:0 auto}
+ .grid{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+ .stat{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+ .stat .n{font-size:26px;font-weight:700} .stat .l{color:var(--mut);font-size:13px;margin-top:2px}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+ .card h2{margin:0 0 10px;font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+ table{width:100%;border-collapse:collapse}
+ th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);font-size:14px}
+ th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+ tr:last-child td{border-bottom:0}
+ .badge{font-size:12px;padding:2px 9px;border-radius:999px;font-weight:600}
+ .b-up{background:rgba(245,158,11,.15);color:var(--amber)} .b-ok{background:rgba(34,197,94,.13);color:var(--green)}
+ .b-warn{background:rgba(239,68,68,.15);color:var(--red)}
+ button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px;font-weight:600;transition:.15s}
+ button:hover{filter:brightness(1.1)} button:disabled{opacity:.5;cursor:not-allowed}
+ button.ghost{background:#232b38} button.warn{background:var(--amber);color:#111} button.sm{padding:5px 11px;font-size:12px}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ pre{background:#0a0d12;border:1px solid var(--line);border-radius:8px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;font-size:12px;line-height:1.5;margin:8px 0 0}
+ small,.mut{color:var(--mut)} .spacer{flex:1}
+ #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2734;border:1px solid var(--line);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none}
+ #toast.show{opacity:1}
+ .dot{width:8px;height:8px;border-radius:50%;display:inline-block} .d-ok{background:var(--green)}.d-up{background:var(--amber)}
+ .muted-img{color:var(--mut);font-size:12px}
 </style></head><body>
-<header><h1>home-server-wud &middot; control panel</h1></header>
+<header>
+  <span style="font-size:20px">&#128295;</span>
+  <h1>Home Server Panel</h1>
+  <span class=pill id=clock></span>
+  <span class=spacer></span>
+  <button class="ghost sm" onclick="load()">&#8635; Refresh</button>
+</header>
 <div class=wrap>
- <div class=bar>
-   <button onclick="backup()">Backup now</button>
-   <button class=gray onclick="load()">Refresh</button>
-   <small id=osline></small>
- </div>
- <div class=card><table id=tbl><thead><tr><th>Container</th><th>Image</th><th>Status</th><th></th></tr></thead><tbody></tbody></table></div>
- <div class=card><b>Output</b><pre id=out>ready.</pre></div>
- <div class=card><b>OS updates</b><pre id=os>...</pre></div>
+
+  <div class=grid>
+    <div class=stat><div class=n id=s-cont>&ndash;</div><div class=l>containers</div></div>
+    <div class=stat><div class=n id=s-upd style="color:var(--amber)">&ndash;</div><div class=l>image updates</div></div>
+    <div class=stat><div class=n id=s-os style="color:var(--accent)">&ndash;</div><div class=l>OS updates</div></div>
+    <div class=stat><div class=n id=s-sec>&ndash;</div><div class=l>security</div></div>
+  </div>
+
+  <div class=card>
+    <h2>&#9889; Actions</h2>
+    <div class=row>
+      <button id=btn-backup onclick="doBackup()">&#128190; Full backup</button>
+      <button id=btn-os class=warn onclick="doOsUpdate()">&#11014;&#65039; Update OS</button>
+      <small id=os-hint class=mut></small>
+    </div>
+    <pre id=out>Ready.</pre>
+  </div>
+
+  <div class=card>
+    <h2>&#128230; Containers</h2>
+    <table id=tbl><thead><tr><th>Container</th><th>Image</th><th>Status</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class=card>
+    <h2>&#128421;&#65039; OS updates</h2>
+    <div id=reboot></div>
+    <pre id=os-snap>...</pre>
+    <div id=os-runwrap style="display:none"><small class=mut>Last OS update run:</small><pre id=os-run></pre></div>
+  </div>
+
 </div>
+<div id=toast></div>
 <script>
 const TOKEN=new URLSearchParams(location.search).get('token')||'';
 const qs=TOKEN?('?token='+encodeURIComponent(TOKEN)):'';
+const $=id=>document.getElementById(id);
+function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600);}
+function tick(){$('clock').textContent=new Date().toLocaleTimeString();}
+setInterval(tick,1000);tick();
+
 async function load(){
- const r=await fetch('/api/status'+qs); const d=await r.json();
- const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
- d.containers.forEach(c=>{
-  const tr=document.createElement('tr');
-  const st=c.update?'<span class=up>update available</span>':'<span class=ok>up to date</span>';
-  const btn=c.update?`<button onclick="upd('${c.name}')">Update</button>`:'';
-  tr.innerHTML=`<td>${c.name}</td><td><small>${c.image}</small></td><td>${st}</td><td>${btn}</td>`;
-  tb.appendChild(tr);
- });
- document.querySelector('#os').textContent=d.os;
- const n=d.containers.filter(c=>c.update).length;
- document.querySelector('#osline').textContent=`${d.containers.length} containers · ${n} with updates`;
+ try{
+  const d=await (await fetch('/api/status'+qs)).json();
+  const nUp=d.containers.filter(c=>c.update).length;
+  $('s-cont').textContent=d.containers.length;
+  $('s-upd').textContent=nUp;
+  $('s-os').textContent=d.os.count;
+  $('s-sec').textContent=d.os.security;
+  $('s-sec').style.color=d.os.security>0?'var(--red)':'var(--txt)';
+  const tb=document.querySelector('#tbl tbody');tb.innerHTML='';
+  d.containers.sort((a,b)=>(b.update-a.update)||a.name.localeCompare(b.name)).forEach(c=>{
+    const tr=document.createElement('tr');
+    const st=c.update?'<span class="badge b-up">update available</span>':'<span class="badge b-ok">up to date</span>';
+    const btn=c.update?'<button class=sm onclick="upd(\''+c.name+'\',this)">Update</button>':'';
+    tr.innerHTML='<td><span class="dot '+(c.update?'d-up':'d-ok')+'"></span> '+c.name+'</td>'+
+                 '<td class=muted-img>'+c.image+'</td><td>'+st+'</td><td style=text-align:right>'+btn+'</td>';
+    tb.appendChild(tr);
+  });
+  $('os-snap').textContent=d.os.snapshot;
+  $('reboot').innerHTML=d.os.reboot?'<span class="badge b-warn">&#9888; reboot required</span>':'';
+  const btnOs=$('btn-os');
+  if(d.os.pending){btnOs.disabled=true;$('os-hint').textContent='OS update running on host\u2026';}
+  else if(d.os.count>0){btnOs.disabled=false;$('os-hint').textContent=d.os.count+' update(s) available';}
+  else{btnOs.disabled=true;$('os-hint').textContent='system is up to date';}
+  if(d.os.runlog){$('os-runwrap').style.display='';$('os-run').textContent=d.os.runlog;}
+ }catch(e){toast('failed to load: '+e);}
 }
-async function backup(){
- out.textContent='running backup...';
- const r=await fetch('/backup'+qs,{method:'POST'}); out.textContent=await r.text();
+function busy(b,on,label){b.disabled=on;if(on){b.dataset.t=b.textContent;b.textContent='\u2026 '+label;}else if(b.dataset.t){b.textContent=b.dataset.t;}}
+async function doBackup(){
+ const b=$('btn-backup');busy(b,true,'backing up');$('out').textContent='Running full backup\u2026 (this can take a minute)';
+ try{const r=await fetch('/backup'+qs,{method:'POST'});$('out').textContent=await r.text();toast('backup done');}
+ catch(e){$('out').textContent='error: '+e;}finally{busy(b,false);}
 }
-async function upd(name){
- if(!confirm('Backup + update '+name+'?'))return;
- out.textContent='updating '+name+' (backup first)...';
- const r=await fetch('/update'+qs+(qs?'&':'?')+'name='+encodeURIComponent(name),{method:'POST'});
- out.textContent=await r.text(); load();
+async function doOsUpdate(){
+ if(!confirm('Apply available OS updates on the host now?\nDocker may briefly restart if it is among the updates.'))return;
+ const b=$('btn-os');busy(b,true,'requesting');
+ try{const r=await fetch('/os-update'+qs,{method:'POST'});$('out').textContent=await r.text();toast('OS update requested');}
+ catch(e){$('out').textContent='error: '+e;}finally{busy(b,false);setTimeout(load,1500);}
 }
-load();
+async function upd(name,btn){
+ if(!confirm('Back up and update '+name+'?'))return;
+ busy(btn,true,'updating');$('out').textContent='Updating '+name+' (backup first)\u2026';
+ try{const r=await fetch('/update'+qs+(qs?'&':'?')+'name='+encodeURIComponent(name),{method:'POST'});
+     $('out').textContent=await r.text();toast(name+' updated');}
+ catch(e){$('out').textContent='error: '+e;}finally{busy(btn,false);load();}
+}
+load();setInterval(load,30000);
 </script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # quieter logs
+    def log_message(self, *a):  # quieter
         pass
 
     def _authed(self, q):
@@ -145,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             ups = wud_updates()
             conts = [{**c, "update": ups.get(c["name"], False)} for c in running_containers()]
-            return self._send(200, json.dumps({"containers": conts, "os": os_snapshot()}),
+            return self._send(200, json.dumps({"containers": conts, "os": os_info()}),
                               "application/json")
         return self._send(404, "not found", "text/plain")
 
@@ -157,6 +260,20 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/backup":
             _, out = sh([os.path.join(SCRIPTS, "backup.sh")])
             return self._send(200, out, "text/plain")
+        if u.path == "/os-update":
+            info = os_info()
+            if info["count"] <= 0:
+                return self._send(200, "System is already up to date — nothing to do.", "text/plain")
+            try:
+                with open(OS_FLAG, "w", encoding="utf-8") as f:
+                    f.write(str(int(time.time())))
+            except Exception as e:  # noqa: BLE001
+                return self._send(500, f"could not write request flag: {e}", "text/plain")
+            return self._send(
+                200,
+                "OS update requested. A host job will apply it within ~1 minute.\n"
+                "Watch the 'OS updates' panel for the run log. A reboot may be needed after.",
+                "text/plain")
         if u.path == "/update":
             name = q.get("name", [""])[0]
             valid = {c["name"] for c in running_containers()}
@@ -168,5 +285,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"home-server-wud panel on :{PORT} (token {'set' if TOKEN else 'not set'})")
+    print(f"panel on :{PORT} (token {'set' if TOKEN else 'off'})")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

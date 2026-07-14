@@ -43,9 +43,10 @@ which have a newer image. Each one gets a manual **Update** button.
 
 A second small UI at **http://<your-server-ip>:4013** gives you buttons:
 
-- **Backup now** — runs a full-stack backup (see below)
+- **Full backup** — runs a full-stack backup (see below)
+- **Update OS** — applies available host OS updates (opt-in, see below)
 - **Update** — per container: **backs up, then pulls + recreates** it
-- Live view of which containers have updates + the OS update count
+- Live view of which containers have updates + the OS update count / reboot flag
 
 Point `PROJECT_DIR` in `.env` at your stack (e.g. `/home/me/docker`) — it's
 mounted at the same path inside the panel so `docker compose` resolves your
@@ -53,6 +54,24 @@ bind-mount paths correctly. Set `PANEL_TOKEN` to require `?token=...`.
 
 > ⚠️ The panel executes Docker operations — keep it on your LAN, never expose it
 > to the internet.
+
+### Enabling the "Update OS" button (opt-in)
+
+A container can't upgrade the host OS directly, so the panel just drops a
+*request flag* and a tiny root cron applies it (decoupled — safe even if Docker
+restarts during the upgrade). Enable it once:
+
+```bash
+sudo crontab -e
+# add (adjust paths to your logs dir + os-update-check.sh):
+* * * * * OS_UPDATE_FLAG=/home/me/docker/logs/.os-update-request \
+          OS_RUNLOG=/home/me/docker/logs/os-update-run.log \
+          SNAPSHOT_SCRIPT=/path/to/scripts/os-update-check.sh SNAPSHOT_USER=me \
+          /path/to/scripts/os-update-runner.sh
+```
+
+The button stays disabled until updates are available, shows "running…" while
+the host applies them, and surfaces the run log + a reboot-required flag.
 
 ---
 
