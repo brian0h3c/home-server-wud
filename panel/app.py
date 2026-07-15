@@ -9,6 +9,7 @@ NAS speed test, graceful reboot (host flag). LAN-only; optional PANEL_TOKEN.
 """
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -25,6 +26,7 @@ REBOOT_FLAG = os.environ.get("REBOOT_FLAG", os.path.join(LOGDIR, ".reboot-reques
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backups")
 MEDIA_CONTAINER = os.environ.get("MEDIA_CONTAINER", "plexms")
 MEDIA_PATH = os.environ.get("MEDIA_TEST_PATH", "/media/Black/Movies")
+QBIT_URL = os.environ.get("QBIT_URL", "http://192.168.50.10:4009")
 QUICK_LINKS = os.environ.get("QUICK_LINKS", "[]")
 TOKEN = os.environ.get("PANEL_TOKEN", "")
 PORT = int(os.environ.get("PANEL_PORT", "8080"))
@@ -104,6 +106,78 @@ def status():
     except Exception:  # noqa: BLE001
         st["links"] = []
     return st
+
+
+# ---------- real-time sampling (needs pid:host so /proc/1 is host init) ----------
+def _read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _net_counters(iface):
+    for ln in _read("/proc/1/net/dev").splitlines():
+        if ":" in ln and ln.split(":", 1)[0].strip() == iface:
+            p = ln.split(":", 1)[1].split()
+            if len(p) >= 9:
+                return int(p[0]), int(p[8])  # rx_bytes, tx_bytes
+    return None
+
+
+def _cpu_counters():
+    line = _read("/proc/stat").splitlines()
+    if not line or not line[0].startswith("cpu "):
+        return None
+    n = [int(x) for x in line[0].split()[1:]]
+    idle = n[3] + (n[4] if len(n) > 4 else 0)
+    return idle, sum(n)
+
+
+def _disk_counters():
+    r = w = 0
+    for ln in _read("/proc/diskstats").splitlines():
+        p = ln.split()
+        if len(p) >= 10 and re.match(r"^(sd[a-z]+|nvme\d+n\d+|mmcblk\d+)$", p[2]):
+            r += int(p[5])
+            w += int(p[9])  # sectors of 512 bytes
+    return r * 512, w * 512
+
+
+def _mem_pct():
+    mt = ma = 0
+    for ln in _read("/proc/meminfo").splitlines():
+        if ln.startswith("MemTotal:"):
+            mt = int(ln.split()[1])
+        elif ln.startswith("MemAvailable:"):
+            ma = int(ln.split()[1])
+    return round((1 - ma / mt) * 100, 1) if mt else 0
+
+
+def live():
+    iface = (read_json(STATUS_JSON).get("net") or {}).get("iface") or ""
+    n1, c1, d1, t1 = _net_counters(iface), _cpu_counters(), _disk_counters(), time.time()
+    time.sleep(0.5)
+    n2, c2, d2 = _net_counters(iface), _cpu_counters(), _disk_counters()
+    dt = max(time.time() - t1, 0.1)
+    out = {"cpu": 0, "mem": _mem_pct(), "net": {"rx_mbps": 0, "tx_mbps": 0},
+           "disk": {"r_mbps": 0, "w_mbps": 0}, "qbit": {"dl_mbps": 0, "up_mbps": 0}}
+    if n1 and n2:
+        out["net"] = {"rx_mbps": round((n2[0] - n1[0]) * 8 / dt / 1e6, 2),
+                      "tx_mbps": round((n2[1] - n1[1]) * 8 / dt / 1e6, 2)}
+    if c1 and c2 and (c2[1] - c1[1]) > 0:
+        out["cpu"] = round((1 - (c2[0] - c1[0]) / (c2[1] - c1[1])) * 100, 1)
+    out["disk"] = {"r_mbps": round((d2[0] - d1[0]) / dt / 1e6, 2),
+                   "w_mbps": round((d2[1] - d1[1]) / dt / 1e6, 2)}
+    try:
+        with urllib.request.urlopen(QBIT_URL + "/api/v2/transfer/info", timeout=2) as r:
+            qb = json.load(r)
+        out["qbit"] = {"dl_mbps": round(qb.get("dl_info_speed", 0) * 8 / 1e6, 2),
+                       "up_mbps": round(qb.get("up_info_speed", 0) * 8 / 1e6, 2)}
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
@@ -202,6 +276,15 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  .tile .tname{font-weight:700;font-size:13px;display:flex;align-items:center;gap:7px;word-break:break-word}
  .tile .tstat{font-size:11px;color:var(--mut);margin:4px 0 9px;min-height:14px}
  .tile .tacts{display:flex;gap:6px;flex-wrap:wrap}
+ /* live sparklines */
+ .spark{width:100%;height:34px;display:block;margin:9px 0 2px;overflow:visible}
+ .spark .sl{fill:none;stroke:currentColor;stroke-width:1.8;vector-effect:non-scaling-stroke;
+   filter:drop-shadow(0 0 3px currentColor);stroke-linejoin:round;stroke-linecap:round}
+ .spark .sa{stroke:none;fill:currentColor;opacity:.13;vector-effect:non-scaling-stroke}
+ .sk-cyan{color:var(--cyan)}.sk-blue{color:var(--blue)}.sk-green{color:var(--green)}
+ .sk-gold{color:var(--gold)}.sk-violet{color:var(--violet)}.sk-red{color:var(--red)}
+ .live{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);
+   box-shadow:0 0 7px var(--green);margin-left:6px;animation:blink 1.4s infinite;vertical-align:middle}
  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0a1830;border:1px solid #1c5578;
    padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;box-shadow:0 0 18px rgba(34,211,238,.2)}
  #toast.show{opacity:1}
@@ -219,18 +302,21 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
   <div class=sec><h2>&#128279; Quick links</h2><div class=links id=links></div></div>
 
   <div class=grid>
-    <div class=card><h3>&#9889; System</h3>
+    <div class=card><h3>&#9889; System <span class=live></span></h3>
       <div class=brandrow id=sys-brands></div>
       <div class=big id=sys-os>&ndash;</div><div class=sub id=sys-kernel></div>
       <div class=kv><span class=k>Uptime</span><span class=v id=sys-uptime></span></div>
       <div class=kv><span class=k>CPU load</span><span class=v id=sys-load></span></div>
+      <svg class=spark id=sp-cpu viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=kv><span class=k>CPU temp</span><span class=v id=sys-temp></span></div>
       <div class=kv><span class=k>Memory</span><span class=v id=sys-mem></span></div><div class=bar id=membar><span></span></div>
       <div class=kv style=margin-top:6px><span class=k>Disk</span><span class=v id=sys-disk></span></div>
+      <div class=kv style=margin-top:6px><span class=k>Disk I/O</span><span class=v id=sys-io>&mdash;</span></div>
+      <svg class=spark id=sp-disk viewBox="0 0 100 34" preserveAspectRatio=none></svg>
     </div>
-    <div class=card><h3>&#128225; Network</h3>
-      <div class=big id=net-dn>&ndash;</div><div class=sub>download (Mbps)</div>
-      <div class=kv style=margin-top:6px><span class=k>&#8593; upload</span><span class=v id=net-up></span></div>
+    <div class=card><h3>&#128225; Network <span class=live></span></h3>
+      <div class=big id=net-dn>&ndash;</div><div class=sub>download Mbps &middot; <span id=net-up></span> up</div>
+      <svg class=spark id=sp-net viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=kv><span class=k>interface</span><span class=v id=net-if></span></div>
     </div>
     <div class=card><h3>&#128190; NAS storage</h3>
@@ -238,10 +324,12 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=kv style=margin-top:8px><span class=k>read speed</span><span class=v id=nas-speed>&mdash;</span></div>
       <button class=sm style=margin-top:6px onclick="nasSpeed(this)">Test speed</button>
     </div>
-    <div class=card><h3>&#128274; VPN (torrents)</h3>
+    <div class=card><h3>&#128274; VPN (torrents) <span class=live></span></h3>
       <div class=big id=vpn-state>&ndash;</div>
       <div class=kv><span class=k>exit IP</span><span class=v id=vpn-ip></span></div>
       <div class=kv><span class=k>port</span><span class=v id=vpn-port></span></div>
+      <div class=kv><span class=k>tunnel throughput</span><span class=v id=vpn-tp>&mdash;</span></div>
+      <svg class=spark id=sp-vpn viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=sub id=vpn-note></div>
     </div>
     <div class=card><h3>&#127918; GPU / drivers</h3>
@@ -249,10 +337,12 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=big id=gpu-name>&ndash;</div>
       <div class=kv><span class=k>driver</span><span class=v id=gpu-driver></span></div>
       <div class=kv><span class=k>temp / usage</span><span class=v id=gpu-tu></span></div>
+      <div class=bar id=gpubar><span></span></div>
       <div class=sub id=gpu-note></div>
     </div>
-    <div class=card><h3>&#8681; Downloads</h3>
+    <div class=card><h3>&#8681; Downloads <span class=live></span></h3>
       <div class=big id=dl-speed>&ndash;</div><div class=sub>total down (Mbps)</div>
+      <svg class=spark id=sp-qbit viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=kv style=margin-top:6px><span class=k>Usenet (SAB)</span><span class=v id=dl-sab></span></div>
       <div class=kv><span class=k>Torrents</span><span class=v id=dl-qbit></span></div>
     </div>
@@ -311,6 +401,34 @@ function brandsFor(text){const t=(text||'').toLowerCase(),out=[];
  else if(/amd|ryzen|threadripper/.test(t))out.push(brand('amd','AMD',text));
  return out;}
 function toggleCont(){const t=$('tiles');t.classList.toggle('collapsed');$('cont-toggle').textContent=t.classList.contains('collapsed')?'Expand':'Collapse';}
+// live sparklines
+const LB={};
+function pushv(k,v){const a=LB[k]||(LB[k]=[]);a.push(Math.max(+v||0,0));if(a.length>50)a.shift();}
+function spark(id,series){const el=$(id);if(!el)return;const W=100,H=34;
+ let mx=0.001;series.forEach(s=>(LB[s.k]||[]).forEach(v=>{if(v>mx)mx=v;}));
+ let html='';series.forEach(s=>{const a=LB[s.k]||[];if(a.length<2)return;
+  const pts=a.map((v,i)=>[(i/(a.length-1))*W,(H-2)-(v/mx)*(H-5)]);
+  const d='M'+pts.map(p=>p[0].toFixed(1)+','+p[1].toFixed(1)).join(' L');
+  if(s.area)html+='<path class="sa '+s.cls+'" d="'+d+' L'+W+','+H+' L0,'+H+' Z"/>';
+  html+='<path class="sl '+s.cls+'" d="'+d+'"/>';});
+ el.innerHTML=html;}
+const fmt=v=>v>=1?v.toFixed(1):v.toFixed(2);
+async function live(){
+ let d;try{d=await(await fetch('/api/live'+qs)).json();}catch(e){return;}
+ pushv('rx',d.net.rx_mbps);pushv('tx',d.net.tx_mbps);pushv('cpu',d.cpu);
+ pushv('dr',d.disk.r_mbps);pushv('dw',d.disk.w_mbps);
+ pushv('qdl',d.qbit.dl_mbps);pushv('qup',d.qbit.up_mbps);
+ $('net-dn').textContent=fmt(d.net.rx_mbps);$('net-up').textContent=fmt(d.net.tx_mbps)+' Mbps';
+ if(d.cpu)$('sys-load').textContent=(($('sys-load').textContent.split(' (')[0])||'')+' ('+d.cpu+'%)';
+ $('sys-io').textContent='R '+fmt(d.disk.r_mbps)+' · W '+fmt(d.disk.w_mbps)+' MB/s';
+ $('vpn-tp').textContent='↓'+fmt(d.qbit.dl_mbps)+' · ↑'+fmt(d.qbit.up_mbps)+' Mbps';
+ $('dl-qbit').textContent='↓'+fmt(d.qbit.dl_mbps)+' · ↑'+fmt(d.qbit.up_mbps)+' Mbps';
+ spark('sp-net',[{k:'rx',cls:'sk-cyan',area:1},{k:'tx',cls:'sk-gold'}]);
+ spark('sp-cpu',[{k:'cpu',cls:'sk-green',area:1}]);
+ spark('sp-disk',[{k:'dr',cls:'sk-cyan',area:1},{k:'dw',cls:'sk-gold'}]);
+ spark('sp-vpn',[{k:'qdl',cls:'sk-violet',area:1},{k:'qup',cls:'sk-gold'}]);
+ spark('sp-qbit',[{k:'qdl',cls:'sk-green',area:1},{k:'qup',cls:'sk-gold'}]);
+}
 
 async function load(){
  let d; try{ d=await (await fetch('/api/status'+qs)).json(); }catch(e){ toast('offline'); return; }
@@ -338,6 +456,7 @@ async function load(){
  const g=d.gpu||{};
  if(!g.present){$('gpu-name').textContent='none';$('gpu-driver').textContent='—';$('gpu-tu').textContent='—';$('gpu-brands').innerHTML='';}
  else{$('gpu-name').textContent=g.name;$('gpu-driver').textContent=g.driver;$('gpu-tu').textContent=(g.temp||'?')+'°C · '+(g.util||'0')+'%';
+   setbar('gpubar',parseInt(g.util)||0,70,90);
    $('gpu-brands').innerHTML=/nvidia|geforce|rtx|gtx/i.test(g.name||'')?brand('nvidia','NVIDIA',g.name):(/radeon|amd/i.test(g.name||'')?brand('amd','AMD',g.name):'');}
  const dw=d.downloads||{}, sab=dw.sab||{}, qb=dw.qbit||{};
  $('dl-speed').textContent=((sab.speed_mbps||0)+(qb.dl_mbps||0)).toFixed(1);
@@ -385,6 +504,7 @@ async function rst(n,b){if(!confirm('Restart '+n+'?'))return;busy(b,true,'…');
 async function lg(n){const box=$('logbox');box.style.display='';box.textContent='loading '+n+' logs…';box.textContent=await (await fetch('/logs'+qs+(qs?'&':'?')+'name='+encodeURIComponent(n))).text();box.scrollIntoView({behavior:'smooth'});}
 async function nasSpeed(b){busy(b,true,'testing');try{const t=await post('/nasspeed');$('nas-speed').textContent=t.trim();toast('NAS: '+t.trim());}catch(e){toast(''+e);}finally{busy(b,false);}}
 load();setInterval(load,20000);
+live();setInterval(live,2000);
 </script></body></html>"""
 
 
@@ -414,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PAGE)
         if u.path == "/api/status":
             return self._send(200, json.dumps(status()), "application/json")
+        if u.path == "/api/live":
+            return self._send(200, json.dumps(live()), "application/json")
         if u.path == "/logs":
             name = q.get("name", [""])[0]
             if name not in {c["name"] for c in running_containers()}:
