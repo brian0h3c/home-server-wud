@@ -37,10 +37,11 @@ fi
 GPU_LINE=$(nvidia-smi --query-gpu=name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
 
 VPN_HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$VPNC" 2>/dev/null || echo "absent")
-VPN_IP=""
-if [ -n "$QBIT_URL" ]; then
-  VPN_IP=$(curl -s -m 6 "$QBIT_URL/api/v2/transfer/info" 2>/dev/null | \
-    python3 -c 'import sys,json;print(json.load(sys.stdin).get("last_external_address_v4",""))' 2>/dev/null || echo "")
+# exit IP straight from gluetun's control server (no external call); fall back to ipify
+VPN_IP=$(docker exec "$VPNC" wget -qO- -T 6 http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null | \
+  python3 -c 'import sys,json;print(json.load(sys.stdin).get("public_ip",""))' 2>/dev/null || echo "")
+if [ -z "$VPN_IP" ]; then
+  VPN_IP=$(docker exec "$VPNC" wget -qO- -T 6 https://api.ipify.org 2>/dev/null || echo "")
 fi
 VPN_PORT=$(docker exec "$VPNC" cat /tmp/gluetun/forwarded_port 2>/dev/null || echo "")
 
