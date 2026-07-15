@@ -27,6 +27,9 @@ BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backups")
 MEDIA_CONTAINER = os.environ.get("MEDIA_CONTAINER", "plexms")
 MEDIA_PATH = os.environ.get("MEDIA_TEST_PATH", "/media/Black/Movies")
 QBIT_URL = os.environ.get("QBIT_URL", "http://192.168.50.10:4009")
+PLEX_PREF_FILE = os.environ.get("PLEX_PREF", "/plex/Preferences.xml")
+PLEX_URL = os.environ.get("PLEX_URL", "http://192.168.50.10:32400")
+HISTORY_DB = os.environ.get("HISTORY_DB", os.path.join(LOGDIR, "history.db"))
 QUICK_LINKS = os.environ.get("QUICK_LINKS", "[]")
 TOKEN = os.environ.get("PANEL_TOKEN", "")
 PORT = int(os.environ.get("PANEL_PORT", "8080"))
@@ -49,6 +52,17 @@ def running_containers():
         if len(parts) >= 3:
             rows.append({"name": parts[0], "image": parts[1], "status": parts[2]})
     return rows
+
+
+def container_stats():
+    _, out = sh(["docker", "stats", "--no-stream", "--format",
+                 "{{.Name}}\t{{.CPUPerc}}\t{{.MemPerc}}\t{{.MemUsage}}"], timeout=30)
+    m = {}
+    for line in out.strip().splitlines():
+        p = line.split("\t")
+        if len(p) >= 3:
+            m[p[0]] = {"cpu": p[1], "memp": p[2], "memu": p[3] if len(p) > 3 else ""}
+    return m
 
 
 def wud_updates():
@@ -86,7 +100,9 @@ def list_backups(limit=15):
 def status():
     st = read_json(STATUS_JSON)
     ups = wud_updates()
-    st["containers"] = [{**c, "update": ups.get(c["name"], False)} for c in running_containers()]
+    stats = container_stats()
+    st["containers"] = [{**c, "update": ups.get(c["name"], False), **stats.get(c["name"], {})}
+                        for c in running_containers()]
     st["backups"] = list_backups()
     try:
         with open(OS_RUNLOG, encoding="utf-8", errors="replace") as f:
@@ -180,9 +196,67 @@ def live():
     return out
 
 
+def speedtest():
+    res = {"down": 0, "up": 0}
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) command-center/1.0"}
+    try:
+        t = time.time()
+        n = 0
+        req = urllib.request.Request("https://speed.cloudflare.com/__down?bytes=25000000", headers=ua)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            while True:
+                b = r.read(65536)
+                if not b:
+                    break
+                n += len(b)
+        res["down"] = round(n * 8 / max(time.time() - t, 0.1) / 1e6, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        payload = b"0" * 10_000_000
+        t = time.time()
+        req = urllib.request.Request("https://speed.cloudflare.com/__up", data=payload,
+                                     method="POST", headers=ua)
+        urllib.request.urlopen(req, timeout=30)
+        res["up"] = round(len(payload) * 8 / max(time.time() - t, 0.1) / 1e6, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return res
+
+
+def plex_token():
+    try:
+        m = re.search(r'PlexOnlineToken="([^"]+)"', open(PLEX_PREF_FILE, encoding="utf-8", errors="replace").read())
+        return m.group(1) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def history(hours=24):
+    cols = ["ts", "cpu_temp", "mem_pct", "disk_pct", "nas_pct", "rx", "tx", "gpu_temp", "gpu_util", "plex"]
+    rows = []
+    try:
+        import sqlite3
+        con = sqlite3.connect(HISTORY_DB, timeout=5)
+        cur = con.execute(f"SELECT {','.join(cols)} FROM metrics WHERE ts>=? ORDER BY ts",
+                          (int(time.time()) - hours * 3600,))
+        rows = cur.fetchall()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"cols": cols, "rows": rows}
+
+
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <title>Command Center</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=manifest href=/manifest.webmanifest>
+<meta name=theme-color content="#050810">
+<link rel=icon href=/icon.svg>
+<link rel=apple-touch-icon href=/icon.svg>
+<meta name=apple-mobile-web-app-capable content=yes>
+<meta name=apple-mobile-web-app-title content="Command">
+<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>
 <style>
  :root{--bg:#050810;--card:#0b1120cc;--line:#16324a;--txt:#d6f3ff;--mut:#5f7d97;
    --cyan:#22d3ee;--blue:#3b82f6;--gold:#ffb020;--green:#2ee6a6;--amber:#f5b544;--red:#ff5470;--violet:#a78bfa}
@@ -285,6 +359,32 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  .sk-gold{color:var(--gold)}.sk-violet{color:var(--violet)}.sk-red{color:var(--red)}
  .live{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);
    box-shadow:0 0 7px var(--green);margin-left:6px;animation:blink 1.4s infinite;vertical-align:middle}
+ /* quick-link health dots */
+ .links a .ld{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle;background:var(--mut)}
+ .links a.up .ld{background:var(--green);box-shadow:0 0 7px var(--green)}
+ .links a.down{border-color:#5a1f2c;color:var(--red)}
+ .links a.down .ld{background:var(--red);box-shadow:0 0 7px var(--red);animation:blink 1.1s infinite}
+ /* plex now-playing rich */
+ .pnow{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid #0f2436;align-items:center}
+ .pnow:last-child{border-bottom:0}
+ .pposter{width:46px;height:69px;border-radius:6px;object-fit:cover;flex:none;background:#0a1830;border:1px solid var(--line)}
+ .pmeta{flex:1;min-width:0}
+ .pmeta b{font-size:14px}
+ .pbar{height:6px;background:#071018;border-radius:5px;overflow:hidden;margin-top:6px;border:1px solid #0e2233}
+ .pbar>span{display:block;height:100%;background:linear-gradient(90deg,#22d3ee,#3b82f6);box-shadow:0 0 8px #22d3ee88}
+ .ptags{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}
+ .ptag{font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--mut)}
+ /* disk / media mini rows */
+ .drow{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid #0f2436;font-size:13px}
+ .drow:last-child{border-bottom:0}
+ /* history charts */
+ .hgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+ .hbox{background:#08111f;border:1px solid var(--line);border-radius:11px;padding:11px 13px}
+ .hbox h4{margin:0 0 2px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-weight:700}
+ .hbox .hv{font-size:16px;font-weight:800;font-family:ui-monospace,monospace;color:#eafcff}
+ .hchart{width:100%;height:54px;display:block;margin-top:6px;overflow:visible}
+ .hchart .sl{fill:none;stroke:currentColor;stroke-width:1.6;vector-effect:non-scaling-stroke;filter:drop-shadow(0 0 3px currentColor)}
+ .hchart .sa{stroke:none;fill:currentColor;opacity:.12}
  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0a1830;border:1px solid #1c5578;
    padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;box-shadow:0 0 18px rgba(34,211,238,.2)}
  #toast.show{opacity:1}
@@ -318,6 +418,8 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=big id=net-dn>&ndash;</div><div class=sub>download Mbps &middot; <span id=net-up></span> up</div>
       <svg class=spark id=sp-net viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=kv><span class=k>interface</span><span class=v id=net-if></span></div>
+      <div class=kv><span class=k>internet</span><span class=v id=speed-res>&mdash;</span></div>
+      <button class=sm style=margin-top:6px onclick="doSpeedtest(this)">Speed test</button>
     </div>
     <div class=card><h3>&#128190; NAS storage</h3>
       <div class=big id=nas-state>&ndash;</div><div class=sub id=nas-sub></div><div class=bar id=nasbar><span></span></div>
@@ -346,10 +448,21 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=kv style=margin-top:6px><span class=k>Usenet (SAB)</span><span class=v id=dl-sab></span></div>
       <div class=kv><span class=k>Torrents</span><span class=v id=dl-qbit></span></div>
     </div>
+    <div class=card><h3>&#128190; Disks (SMART)</h3>
+      <div id=disks><small class=mut>&ndash;</small></div>
+    </div>
+    <div class=card><h3>&#127916; Media library</h3>
+      <div id=media><small class=mut>&ndash;</small></div>
+    </div>
   </div>
 
   <div class=sec><h2>&#127909; Plex &mdash; now playing <small id=plex-n></small></h2>
     <div id=plex-list><small class=mut>nothing playing</small></div>
+  </div>
+
+  <div class=sec>
+    <div class=sechead><h2>&#128200; History (24h)</h2></div>
+    <div class=hgrid id=hist></div>
   </div>
 
   <div class=sec><h2>&#11014; Updates &amp; actions</h2>
@@ -464,7 +577,14 @@ async function load(){
  $('dl-qbit').textContent=(qb.dl_mbps||0)+' Mbps · '+(qb.active||0)+' active';
  // plex
  const ps=(d.plex||{}).sessions||[]; $('plex-n').textContent=ps.length?('· '+ps.length+' streaming'):'';
- $('plex-list').innerHTML=ps.length?ps.map(x=>'<div class=now><span class=eq><i></i><i></i><i></i><i></i></span><div><b>'+x.title+'</b><br><small class=mut>'+(x.user||'')+' · '+x.mode+'</small></div></div>').join(''):'<small class=mut>nothing playing</small>';
+ $('plex-list').innerHTML=ps.length?ps.map(function(x){
+  const poster=x.thumb?('<img class=pposter loading=lazy src="/plex-img?key='+encodeURIComponent(x.thumb)+(TOKEN?('&token='+encodeURIComponent(TOKEN)):'')+'">'):'<div class=pposter></div>';
+  const tags=[x.quality,x.mode,x.player].filter(Boolean).map(t=>'<span class=ptag>'+t+'</span>').join('');
+  const bw=x.bandwidth?('<span class=ptag>'+x.bandwidth+' Mbps</span>'):'';
+  return '<div class=pnow>'+poster+'<div class=pmeta><b>'+x.title+'</b><br><small class=mut>'+(x.user||'')+'</small>'+
+   '<div class=pbar><span style="width:'+(x.progress||0)+'%"></span></div>'+
+   '<div class=ptags>'+tags+bw+'</div></div></div>';
+ }).join(''):'<small class=mut>nothing playing</small>';
  // updates
  const u=d.updates||{};
  $('os-line').textContent=(u.os_count>0)?(u.os_count+' OS update(s)'+(u.os_security>0?' · '+u.os_security+' security':'')):'up to date';
@@ -483,7 +603,7 @@ async function load(){
   const ub=c.update?'<button class=sm onclick="upd(\''+c.name+'\',this)">Update</button> ':'';
   return '<div class="tile'+(c.update?' upd':(running?'':' down'))+'">'+
    '<div class=tname>'+dot(running?'ok':'bad')+c.name+'</div>'+
-   '<div class=tstat>'+c.status+'</div>'+
+   '<div class=tstat>'+c.status+(c.cpu?(' · '+c.cpu+' cpu'):'')+(c.memp?(' · '+c.memp+' mem'):'')+'</div>'+
    '<div style=margin-bottom:8px>'+bdg+'</div>'+
    '<div class=tacts>'+ub+'<button class=sm onclick="rst(\''+c.name+'\',this)">Restart</button> <button class=sm onclick="lg(\''+c.name+'\')">Logs</button></div>'+
    '</div>';
@@ -493,7 +613,21 @@ async function load(){
  $('bk-count').textContent='· '+bk.length;
  bt.innerHTML=bk.length?bk.map(b=>'<tr><td><small>'+b.name+'</small></td><td>'+(b.size_mb>=1024?(b.size_mb/1024).toFixed(1)+' GB':b.size_mb+' MB')+'</td><td><small>'+b.date+'</small></td></tr>').join(''):'<tr><td colspan=3><small class=mut>none yet</small></td></tr>';
  // links
- $('links').innerHTML=(d.links||[]).map(l=>'<a href="'+l.url+'" target=_blank>'+l.name+' &#8599;</a>').join('')||'<small class=mut>none configured</small>';
+ // links + service health
+ const svc={};(d.services||[]).forEach(s=>svc[s.name]=s);
+ $('links').innerHTML=(d.links||[]).map(function(l){const s=svc[l.name];const cls=s?(s.up?'up':'down'):'';
+  return '<a class="'+cls+'" href="'+l.url+'" target=_blank><span class=ld></span>'+l.name+' &#8599;</a>';}).join('')||'<small class=mut>none configured</small>';
+ // disks (SMART)
+ const disks=d.disks||[];
+ $('disks').innerHTML=disks.length?disks.map(function(k){
+  const bad=(k.ok===false)||(k.warn&&k.warn!==0);
+  const bits=[];if(k.temp!=null)bits.push(k.temp+'°C');if(k.pct_used!=null)bits.push(k.pct_used+'% used');if(k.hours!=null)bits.push(Math.round(k.hours/24)+'d on');
+  return '<div class=drow><span>'+dot(bad?'bad':'ok')+(k.name||'')+' <small class=mut>'+(k.model||'')+'</small></span><span class=v>'+bits.join(' · ')+'</span></div>';
+ }).join(''):'<small class=mut>no SMART data yet</small>';
+ // media library (radarr/sonarr)
+ const md=d.media||{};
+ function arrRow(name,a){return a?('<div class=drow><span>'+name+'</span><span class=v>'+(a.queue||0)+' queue · '+(a.missing||0)+' missing</span></div>'):('<div class=drow><span>'+name+'</span><span class=mut>offline</span></div>');}
+ $('media').innerHTML=arrRow('Radarr (movies)',md.radarr)+arrRow('Sonarr (TV)',md.sonarr);
 }
 async function post(path){return (await fetch(path+qs,{method:'POST'})).text();}
 async function doBackup(b){busy(b,true,'backing up');showout('Running full backup…');try{showout(await post('/backup'));toast('backup done');}catch(e){showout(''+e);}finally{busy(b,false);load();}}
@@ -503,9 +637,48 @@ async function upd(n,b){if(!confirm('Back up and update '+n+'?'))return;busy(b,t
 async function rst(n,b){if(!confirm('Restart '+n+'?'))return;busy(b,true,'…');try{showout(await post('/restart?name='+encodeURIComponent(n)));toast(n+' restarted');}catch(e){showout(''+e);}finally{busy(b,false);load();}}
 async function lg(n){const box=$('logbox');box.style.display='';box.textContent='loading '+n+' logs…';box.textContent=await (await fetch('/logs'+qs+(qs?'&':'?')+'name='+encodeURIComponent(n))).text();box.scrollIntoView({behavior:'smooth'});}
 async function nasSpeed(b){busy(b,true,'testing');try{const t=await post('/nasspeed');$('nas-speed').textContent=t.trim();toast('NAS: '+t.trim());}catch(e){toast(''+e);}finally{busy(b,false);}}
+async function doSpeedtest(b){busy(b,true,'testing');$('speed-res').textContent='running…';try{const r=JSON.parse(await post('/speedtest'));$('speed-res').textContent='↓'+r.down+' · ↑'+r.up+' Mbps';toast('Internet: ↓'+r.down+' ↑'+r.up+' Mbps');}catch(e){$('speed-res').textContent='failed';}finally{busy(b,false);}}
+function drawChart(id,a){const el=$(id);if(!el||a.length<2)return;const W=100,H=54;const mx=Math.max.apply(null,a.concat(0.001)),mn=Math.min.apply(null,a.concat(0)),rng=(mx-mn)||1;
+ const pts=a.map((v,i)=>[(i/(a.length-1))*W,(H-3)-((v-mn)/rng)*(H-6)]);
+ const p='M'+pts.map(q=>q[0].toFixed(1)+','+q[1].toFixed(1)).join(' L');
+ el.innerHTML='<path class=sa d="'+p+' L'+W+','+H+' L0,'+H+' Z"/><path class=sl d="'+p+'"/>';}
+async function loadHist(){
+ let h;try{h=await(await fetch('/api/history?hours=24'+(qs?('&'+qs.slice(1)):''))).json();}catch(e){return;}
+ const rows=h.rows||[],idx={};(h.cols||[]).forEach((c,i)=>idx[c]=i);
+ const S=[{k:'cpu_temp',t:'CPU temp',u:'°C',c:'sk-red'},{k:'gpu_temp',t:'GPU temp',u:'°C',c:'sk-green'},{k:'mem_pct',t:'Memory',u:'%',c:'sk-violet'},{k:'nas_pct',t:'NAS used',u:'%',c:'sk-cyan'},{k:'rx',t:'Net down',u:'Mbps',c:'sk-cyan'},{k:'plex',t:'Plex streams',u:'',c:'sk-gold'}];
+ $('hist').innerHTML=S.map((s,i)=>'<div class=hbox><h4>'+s.t+'</h4><div class=hv id=hv'+i+'>–</div><svg class="hchart '+s.c+'" id=hc'+i+' viewBox="0 0 100 54" preserveAspectRatio=none></svg></div>').join('');
+ S.forEach(function(s,i){const a=rows.map(r=>+r[idx[s.k]]||0);if(!a.length)return;$('hv'+i).textContent=a[a.length-1]+(s.u?(' '+s.u):'');drawChart('hc'+i,a);});
+}
 load();setInterval(load,20000);
 live();setInterval(live,2000);
+loadHist();setInterval(loadHist,60000);
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 </script></body></html>"""
+
+
+ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">'
+            '<rect width="128" height="128" rx="26" fill="#050810"/>'
+            '<circle cx="64" cy="64" r="40" fill="none" stroke="#22d3ee" stroke-width="7"/>'
+            '<circle cx="64" cy="64" r="20" fill="#22d3ee"/>'
+            '<circle cx="64" cy="64" r="52" fill="none" stroke="#22d3ee" stroke-width="3" opacity="0.5"/>'
+            '</svg>')
+
+MANIFEST = json.dumps({
+    "name": "Command Center", "short_name": "Command", "start_url": "/",
+    "display": "standalone", "background_color": "#050810", "theme_color": "#050810",
+    "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}],
+})
+
+SW_JS = (
+    "const C='hsw-v1';"
+    "self.addEventListener('install',e=>{self.skipWaiting();});"
+    "self.addEventListener('activate',e=>{self.clients.claim();});"
+    "self.addEventListener('fetch',e=>{const u=new URL(e.request.url);"
+    "if(u.pathname.startsWith('/api')||u.pathname.startsWith('/logs')||u.pathname==='/plex-img'){return;}"
+    "e.respondWith(fetch(e.request).then(r=>{const c=r.clone();"
+    "caches.open(C).then(x=>x.put(e.request,c));return r;})"
+    ".catch(()=>caches.match(e.request)));});"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -528,6 +701,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        if u.path == "/manifest.webmanifest":
+            return self._send(200, MANIFEST, "application/manifest+json")
+        if u.path == "/sw.js":
+            return self._send(200, SW_JS, "application/javascript")
+        if u.path == "/icon.svg":
+            return self._send(200, ICON_SVG, "image/svg+xml")
         if not self._authed(q):
             return self._send(401, "unauthorized", "text/plain")
         if u.path == "/":
@@ -536,6 +715,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(status()), "application/json")
         if u.path == "/api/live":
             return self._send(200, json.dumps(live()), "application/json")
+        if u.path == "/api/history":
+            hrs = q.get("hours", ["24"])[0]
+            try:
+                hrs = max(1, min(168, int(hrs)))
+            except Exception:  # noqa: BLE001
+                hrs = 24
+            return self._send(200, json.dumps(history(hrs)), "application/json")
+        if u.path == "/plex-img":
+            key = q.get("key", [""])[0]
+            tok = plex_token()
+            if not key.startswith("/library/") or not tok:
+                return self._send(404, b"", "image/gif")
+            try:
+                url = PLEX_URL + key + ("&" if "?" in key else "?") + "X-Plex-Token=" + tok
+                with urllib.request.urlopen(url, timeout=8) as r:
+                    return self._send(200, r.read(), r.headers.get("Content-Type", "image/jpeg"))
+            except Exception:  # noqa: BLE001
+                return self._send(404, b"", "image/gif")
         if u.path == "/logs":
             name = q.get("name", [""])[0]
             if name not in {c["name"] for c in running_containers()}:
@@ -553,6 +750,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/backup":
             _, out = sh([os.path.join(SCRIPTS, "backup.sh")])
             return self._send(200, out, "text/plain")
+        if u.path == "/speedtest":
+            return self._send(200, json.dumps(speedtest()), "application/json")
         if u.path == "/os-update":
             if read_json(STATUS_JSON).get("updates", {}).get("os_count", 0) <= 0:
                 return self._send(200, "Already up to date.", "text/plain")

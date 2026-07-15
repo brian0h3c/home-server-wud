@@ -21,31 +21,53 @@ STATE = os.environ.get("ALERT_STATE", "/home/b/docker/backup/.alert-state.json")
 ENV_FILE = os.environ.get("ENV_FILE", "/home/b/docker/.env")
 TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 CHAT = os.environ.get("TG_CHAT_ID", "")
+NTFY_URL = os.environ.get("NTFY_URL", "")        # e.g. https://ntfy.sh/my-server-topic
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 DISK_ROOT_MAX = int(os.environ.get("DISK_ROOT_MAX", "90"))
 NAS_MAX = int(os.environ.get("NAS_MAX", "96"))
 HOSTNAME = os.environ.get("SERVER_NAME", os.uname().nodename)
 
 # fall back to reading creds from the .env file
-if (not TOKEN or not CHAT) and os.path.exists(ENV_FILE):
+_ENVK = ("TG_BOT_TOKEN", "TG_CHAT_ID", "NTFY_URL", "DISCORD_WEBHOOK")
+if os.path.exists(ENV_FILE):
+    _vals = {}
     for line in open(ENV_FILE, encoding="utf-8", errors="replace"):
-        m = re.match(r"\s*(TG_BOT_TOKEN|TG_CHAT_ID)\s*=\s*(.+?)\s*$", line)
+        m = re.match(r"\s*(" + "|".join(_ENVK) + r")\s*=\s*(.+?)\s*$", line)
         if m:
-            if m.group(1) == "TG_BOT_TOKEN" and not TOKEN:
-                TOKEN = m.group(2).strip().strip('"')
-            if m.group(1) == "TG_CHAT_ID" and not CHAT:
-                CHAT = m.group(2).strip().strip('"')
+            _vals[m.group(1)] = m.group(2).strip().strip('"')
+    TOKEN = TOKEN or _vals.get("TG_BOT_TOKEN", "")
+    CHAT = CHAT or _vals.get("TG_CHAT_ID", "")
+    NTFY_URL = NTFY_URL or _vals.get("NTFY_URL", "")
+    DISCORD_WEBHOOK = DISCORD_WEBHOOK or _vals.get("DISCORD_WEBHOOK", "")
 
-if not TOKEN or not CHAT:
-    raise SystemExit(0)  # not configured yet — do nothing quietly
+if not ((TOKEN and CHAT) or NTFY_URL or DISCORD_WEBHOOK):
+    raise SystemExit(0)  # no channel configured yet — do nothing quietly
 
 
 def send(text):
-    data = urllib.parse.urlencode({"chat_id": CHAT, "text": text,
-                                   "parse_mode": "HTML", "disable_web_page_preview": "true"}).encode()
-    try:
-        urllib.request.urlopen(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data=data, timeout=10)
-    except Exception:  # noqa: BLE001
-        pass
+    plain = re.sub(r"<[^>]+>", "", text)
+    if TOKEN and CHAT:
+        try:
+            data = urllib.parse.urlencode({"chat_id": CHAT, "text": text, "parse_mode": "HTML",
+                                           "disable_web_page_preview": "true"}).encode()
+            urllib.request.urlopen(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data=data, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+    if NTFY_URL:
+        try:
+            req = urllib.request.Request(NTFY_URL, data=plain.encode(),
+                                         headers={"Title": HOSTNAME, "Tags": "warning"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+    if DISCORD_WEBHOOK:
+        try:
+            data = json.dumps({"content": f"**{HOSTNAME}**\n{plain}"}).encode()
+            req = urllib.request.Request(DISCORD_WEBHOOK, data=data,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def load(path, default):
@@ -86,6 +108,15 @@ if d.get("updates", {}).get("os_security", 0) > 0:
 for c in d.get("containers", []):
     if not str(c.get("status", "")).lower().startswith("up"):
         issues["cont_" + c["name"]] = f"🔴 Container <b>{c['name']}</b> is down ({c.get('status','?')})"
+for s in d.get("services", []):
+    if not s.get("up"):
+        issues["svc_" + s["name"]] = f"🔴 Service <b>{s['name']}</b> is not responding"
+for disk in d.get("disks", []):
+    if disk.get("ok") is False or (disk.get("warn") not in (None, 0)):
+        issues["smart_" + disk["name"]] = f"🔴 Disk <b>{disk['name']}</b> SMART health warning"
+    pu = disk.get("pct_used")
+    if isinstance(pu, (int, float)) and pu >= 90:
+        issues["wear_" + disk["name"]] = f"🟠 Disk <b>{disk['name']}</b> wear at <b>{pu}%</b>"
 
 prev = load(STATE, {})
 prev_keys = set(prev.keys()) if isinstance(prev, dict) else set()

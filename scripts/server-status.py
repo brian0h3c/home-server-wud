@@ -11,7 +11,9 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 OUT = os.environ.get("STATUS_JSON", "/tmp/server-status.json")
 NAS = os.environ.get("NAS_PATH", "")
@@ -23,6 +25,14 @@ SAB_INI = os.environ.get("SAB_INI", "")
 SAB_URL = os.environ.get("SAB_URL", "")
 QBIT_URL = os.environ.get("QBIT_URL", "")
 NET_STATE = os.environ.get("NET_STATE", OUT + ".net")
+_DIR = os.path.dirname(OUT) or "."
+LINKS_JSON = os.environ.get("LINKS_JSON", os.path.join(_DIR, "links.json"))
+SMART_JSON = os.environ.get("SMART_JSON", os.path.join(_DIR, "smart.json"))
+HISTORY_DB = os.environ.get("HISTORY_DB", os.path.join(_DIR, "history.db"))
+RADARR_CFG = os.environ.get("RADARR_CFG", "/home/b/docker/radarr/config.xml")
+RADARR_URL = os.environ.get("RADARR_URL", "http://192.168.50.10:4002")
+SONARR_CFG = os.environ.get("SONARR_CFG", "/home/b/docker/sonarr4/config.xml")
+SONARR_URL = os.environ.get("SONARR_URL", "http://192.168.50.10:4003")
 
 
 def run(args, t=8):
@@ -165,13 +175,27 @@ if PLEX_PREF:
     if tok:
         xml = http_text(f"{PLEX_URL}/status/sessions?X-Plex-Token={tok.group(1)}")
         for vb in re.findall(r"<Video\b.*?</Video>", xml, re.S):
-            title = (re.search(r'\btitle="([^"]*)"', vb) or [None, ""])[1]
-            gp = re.search(r'grandparentTitle="([^"]*)"', vb)
+            def a(name, b=vb):
+                m = re.search(r'\b' + name + r'="([^"]*)"', b)
+                return m.group(1) if m else ""
+            title = a("title")
+            gp = a("grandparentTitle")
             user = (re.search(r'<User [^>]*title="([^"]*)"', vb) or [None, ""])[1]
+            offset = float(a("viewOffset") or 0)
+            dur = float(a("duration") or 0)
+            bw = re.search(r'<Session [^>]*bandwidth="(\d+)"', vb)
+            player = (re.search(r'<Player [^>]*(?:title|product)="([^"]*)"', vb) or [None, ""])[1]
+            mres = (re.search(r'<Media [^>]*videoResolution="([^"]*)"', vb) or [None, ""])[1]
+            thumb = a("grandparentThumb") or a("thumb") or a("parentThumb")
             plex["sessions"].append({
-                "title": (gp.group(1) + " · " if gp else "") + title,
+                "title": (gp + " · " if gp else "") + title,
                 "user": user,
                 "mode": "transcode" if 'videoDecision="transcode"' in vb else "direct play",
+                "progress": round(offset / dur * 100) if dur else 0,
+                "bandwidth": round(int(bw.group(1)) / 1000, 1) if bw else 0,
+                "player": player,
+                "quality": mres.upper() if mres else "",
+                "thumb": thumb,
             })
 
 # ---------- Downloads ----------
@@ -208,6 +232,54 @@ for line in run(["ubuntu-drivers", "devices"]).splitlines():
         if mm:
             nvrec = mm.group(1)
 
+# ---------- service health (probe each quick link) ----------
+def probe(url, t=4):
+    if not url:
+        return False, None
+    start = time.time()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=t)
+        return True, round((time.time() - start) * 1000)
+    except urllib.error.HTTPError:
+        return True, round((time.time() - start) * 1000)  # responded (even 401/403) = up
+    except Exception:  # noqa: BLE001
+        return False, None
+
+
+links = []
+try:
+    links = json.loads(read(LINKS_JSON)) or []
+except Exception:  # noqa: BLE001
+    links = []
+services = []
+if links:
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        probed = list(ex.map(lambda l: (l, probe(l.get("url", ""))), links))
+    services = [{"name": l.get("name"), "url": l.get("url"), "up": r[0], "ms": r[1]}
+                for l, r in probed]
+
+# ---------- Radarr / Sonarr queues ----------
+def arr(cfg, base):
+    if not os.path.exists(cfg):
+        return None
+    key = re.search(r"<ApiKey>([a-f0-9]+)</ApiKey>", read(cfg))
+    if not key:
+        return None
+    h = {"X-Api-Key": key.group(1)}
+    q = http_json(f"{base}/api/v3/queue?page=1&pageSize=1", headers=h) or {}
+    miss = http_json(f"{base}/api/v3/wanted/missing?page=1&pageSize=1", headers=h) or {}
+    return {"queue": q.get("totalRecords", 0), "missing": miss.get("totalRecords", 0)}
+
+
+media = {"radarr": arr(RADARR_CFG, RADARR_URL), "sonarr": arr(SONARR_CFG, SONARR_URL)}
+
+# ---------- disk SMART health (written by root smart-check cron) ----------
+disks = []
+try:
+    disks = json.loads(read(SMART_JSON)).get("disks", [])
+except Exception:  # noqa: BLE001
+    disks = []
+
 data = {
     "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
     "system": {"os": osr.get("PRETTY_NAME", "Linux"), "kernel": os.uname().release,
@@ -220,8 +292,39 @@ data = {
     "vpn": vpn,
     "plex": plex,
     "downloads": downloads,
+    "services": services,
+    "media": media,
+    "disks": disks,
     "updates": {"os_count": osc, "os_security": oss, "reboot": reboot, "nvidia_recommended": nvrec},
 }
 tmp = OUT + ".tmp"
 open(tmp, "w").write(json.dumps(data, indent=1))
 os.replace(tmp, OUT)
+
+# ---------- append to history (24h/7d trend graphs) ----------
+try:
+    import sqlite3
+    con = sqlite3.connect(HISTORY_DB, timeout=5)
+    con.execute("CREATE TABLE IF NOT EXISTS metrics(ts INTEGER PRIMARY KEY, cpu_temp REAL, "
+                "mem_pct REAL, disk_pct REAL, nas_pct REAL, rx REAL, tx REAL, gpu_temp REAL, "
+                "gpu_util REAL, plex INTEGER)")
+
+    def _i(v):
+        try:
+            return int(str(v).rstrip("%"))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    con.execute("INSERT OR REPLACE INTO metrics VALUES(?,?,?,?,?,?,?,?,?,?)", (
+        int(time.time()), cpu_temp or 0,
+        round(mem_used / mem_total * 100, 1) if mem_total else 0,
+        _i(disk_pct), _i(nas.get("used_pct", 0)),
+        net.get("rx_mbps", 0), net.get("tx_mbps", 0),
+        float(gpu.get("temp") or 0) if gpu.get("present") else 0,
+        float(gpu.get("util") or 0) if gpu.get("present") else 0,
+        len(plex["sessions"])))
+    con.execute("DELETE FROM metrics WHERE ts < ?", (int(time.time()) - 7 * 86400,))
+    con.commit()
+    con.close()
+except Exception:  # noqa: BLE001
+    pass
