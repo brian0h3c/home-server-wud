@@ -90,6 +90,20 @@ for tp in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
         if "pkg" in ty or "core" in ty:
             break
 
+
+# ---------- hardware identity (non-secret DMI + CPU model) ----------
+def dmi(name):
+    return read(f"/sys/class/dmi/id/{name}").strip()
+
+
+cpu_model = ""
+for line in read("/proc/cpuinfo").splitlines():
+    if line.lower().startswith("model name"):
+        cpu_model = line.split(":", 1)[1].strip()
+        break
+hw = {"vendor": dmi("sys_vendor"), "board": dmi("board_name"),
+      "product": dmi("product_name"), "bios": dmi("bios_version"), "cpu": cpu_model}
+
 # ---------- network (rate via delta) ----------
 iface = ""
 for line in run(["ip", "route"]).splitlines():
@@ -199,7 +213,7 @@ data = {
     "system": {"os": osr.get("PRETTY_NAME", "Linux"), "kernel": os.uname().release,
                "uptime": uptime, "load": load, "ncpu": ncpu, "cpu_temp": cpu_temp,
                "mem_used_mb": mem_used, "mem_total_mb": mem_total,
-               "disk_root_pct": disk_pct, "disk_root_free": disk_free},
+               "disk_root_pct": disk_pct, "disk_root_free": disk_free, "hw": hw},
     "net": net,
     "nas": nas,
     "gpu": gpu,

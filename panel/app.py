@@ -178,6 +178,30 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  .eq i{width:3px;background:var(--cyan);box-shadow:0 0 6px var(--cyan);animation:eq 1s infinite ease-in-out}
  .eq i:nth-child(2){animation-delay:.2s}.eq i:nth-child(3){animation-delay:.4s}.eq i:nth-child(4){animation-delay:.15s}
  @keyframes eq{0%,100%{height:4px}50%{height:16px}}
+ /* hardware brand badges */
+ .brandrow{display:flex;gap:7px;flex-wrap:wrap;margin:0 0 10px}
+ .brand{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:800;letter-spacing:1.5px;
+   padding:3px 9px 3px 8px;border-radius:7px;border:1px solid currentColor;background:#060d18;text-transform:uppercase;
+   font-family:ui-monospace,monospace;line-height:1}
+ .beye{width:22px;height:12px;flex:none}
+ .b-nvidia{color:#76b900;box-shadow:0 0 10px rgba(118,185,0,.35),inset 0 0 12px rgba(118,185,0,.08);text-shadow:0 0 8px rgba(118,185,0,.6)}
+ .b-rog{color:#ff1e40;box-shadow:0 0 10px rgba(255,30,64,.35),inset 0 0 12px rgba(255,30,64,.08);text-shadow:0 0 8px rgba(255,30,64,.6)}
+ .b-asus{color:#31a9e0;box-shadow:0 0 10px rgba(49,169,224,.3)}
+ .b-intel{color:#3ec6ff;box-shadow:0 0 10px rgba(62,198,255,.3);text-shadow:0 0 8px rgba(62,198,255,.5)}
+ .b-amd{color:#ff4d4d;box-shadow:0 0 10px rgba(255,77,77,.3)}
+ /* section header w/ action + container tiles */
+ .sechead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+ .sechead h2{margin:0}
+ .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:11px}
+ .tiles.collapsed{display:none}
+ .tile{background:#08111f;border:1px solid var(--line);border-radius:11px;padding:11px 12px;transition:.15s;position:relative;overflow:hidden}
+ .tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--green);box-shadow:0 0 8px var(--green)}
+ .tile.down::before{background:var(--red);box-shadow:0 0 8px var(--red)}
+ .tile.upd::before{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+ .tile:hover{border-color:#2b587e;box-shadow:0 0 14px rgba(34,211,238,.14);transform:translateY(-2px)}
+ .tile .tname{font-weight:700;font-size:13px;display:flex;align-items:center;gap:7px;word-break:break-word}
+ .tile .tstat{font-size:11px;color:var(--mut);margin:4px 0 9px;min-height:14px}
+ .tile .tacts{display:flex;gap:6px;flex-wrap:wrap}
  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0a1830;border:1px solid #1c5578;
    padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;box-shadow:0 0 18px rgba(34,211,238,.2)}
  #toast.show{opacity:1}
@@ -192,8 +216,11 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 </header>
 <div class=wrap>
 
+  <div class=sec><h2>&#128279; Quick links</h2><div class=links id=links></div></div>
+
   <div class=grid>
     <div class=card><h3>&#9889; System</h3>
+      <div class=brandrow id=sys-brands></div>
       <div class=big id=sys-os>&ndash;</div><div class=sub id=sys-kernel></div>
       <div class=kv><span class=k>Uptime</span><span class=v id=sys-uptime></span></div>
       <div class=kv><span class=k>CPU load</span><span class=v id=sys-load></span></div>
@@ -218,6 +245,7 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=sub id=vpn-note></div>
     </div>
     <div class=card><h3>&#127918; GPU / drivers</h3>
+      <div class=brandrow id=gpu-brands></div>
       <div class=big id=gpu-name>&ndash;</div>
       <div class=kv><span class=k>driver</span><span class=v id=gpu-driver></span></div>
       <div class=kv><span class=k>temp / usage</span><span class=v id=gpu-tu></span></div>
@@ -245,16 +273,18 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
     <details><summary>OS update run log</summary><pre id=os-run>&ndash;</pre></details>
   </div>
 
-  <div class=sec><h2>&#128230; Containers <small id=cont-count></small></h2>
-    <table id=tbl><thead><tr><th>Name</th><th>Status</th><th>Update</th><th></th></tr></thead><tbody></tbody></table>
+  <div class=sec>
+    <div class=sechead>
+      <h2>&#128230; Containers <small id=cont-count></small></h2>
+      <button class=sm id=cont-toggle onclick="toggleCont()">Collapse</button>
+    </div>
+    <div class=tiles id=tiles></div>
     <pre id=logbox style=display:none></pre>
   </div>
 
   <div class=sec><h2>&#128451; Backups <small id=bk-count></small></h2>
     <table id=bktbl><thead><tr><th>File</th><th>Size</th><th>When</th></tr></thead><tbody></tbody></table>
   </div>
-
-  <div class=sec><h2>&#128279; Quick links</h2><div class=links id=links></div></div>
 
   <div class=sec><h2>&#9211; Power</h2>
     <div class=row><button class=danger onclick="doReboot(this)">Reboot server</button>
@@ -272,12 +302,23 @@ function dot(k){return '<span class="dot d-'+k+'"></span> ';}
 function setbar(el,pct,warn,bad){const b=$(el);b.className='bar'+(pct>=bad?' bad':(pct>=warn?' warn':''));b.firstElementChild.style.width=Math.min(100,pct||0)+'%';}
 function busy(b,on,l){if(!b)return;b.disabled=on;if(on){b.dataset.t=b.textContent;b.textContent='… '+l;}else if(b.dataset.t){b.textContent=b.dataset.t;}}
 function showout(t){const o=$('out');o.style.display='';o.textContent=t;}
+const EYE='<svg class=beye viewBox="0 0 44 22"><ellipse cx=22 cy=11 rx=19 ry=9 fill=none stroke=currentColor stroke-width=2.6/><circle cx=22 cy=11 r=3.4 fill=currentColor/></svg>';
+function brand(kind,label,title){const eye=(kind==='nvidia'||kind==='rog')?EYE:'';return '<span class="brand b-'+kind+'" title="'+(title||label).replace(/"/g,'')+'">'+eye+label+'</span>';}
+function brandsFor(text){const t=(text||'').toLowerCase(),out=[];
+ if(/rog|republic of gamers/.test(t))out.push(brand('rog','ROG',text));
+ else if(/asus/.test(t))out.push(brand('asus','ASUS',text));
+ if(/intel|core\s*i\d|\bi[3579]-/.test(t))out.push(brand('intel','intel',text));
+ else if(/amd|ryzen|threadripper/.test(t))out.push(brand('amd','AMD',text));
+ return out;}
+function toggleCont(){const t=$('tiles');t.classList.toggle('collapsed');$('cont-toggle').textContent=t.classList.contains('collapsed')?'Expand':'Collapse';}
 
 async function load(){
  let d; try{ d=await (await fetch('/api/status'+qs)).json(); }catch(e){ toast('offline'); return; }
  $('asof').textContent=(d.generated||'?');
  const s=d.system||{};
  $('sys-os').textContent=s.os||'—'; $('sys-kernel').textContent='kernel '+(s.kernel||'?');
+ const hw=s.hw||{};
+ $('sys-brands').innerHTML=[].concat(brandsFor((hw.board||'')+' '+(hw.vendor||'')),brandsFor(hw.cpu||'')).join('');
  $('sys-uptime').textContent=s.uptime||'?';
  const nc=s.ncpu||1, cp=Math.round((parseFloat(s.load||0)/nc)*100);
  $('sys-load').textContent=(s.load||'?')+' ('+cp+'%)';
@@ -295,8 +336,9 @@ async function load(){
  $('vpn-ip').textContent=v.exit_ip||'—'; $('vpn-port').textContent=v.port||'—';
  $('vpn-note').textContent=up?'torrents exit via VPN, not home IP':'kill-switch: torrents blocked until VPN is back';
  const g=d.gpu||{};
- if(!g.present){$('gpu-name').textContent='none';$('gpu-driver').textContent='—';$('gpu-tu').textContent='—';}
- else{$('gpu-name').textContent=g.name;$('gpu-driver').textContent=g.driver;$('gpu-tu').textContent=(g.temp||'?')+'°C · '+(g.util||'0')+'%';}
+ if(!g.present){$('gpu-name').textContent='none';$('gpu-driver').textContent='—';$('gpu-tu').textContent='—';$('gpu-brands').innerHTML='';}
+ else{$('gpu-name').textContent=g.name;$('gpu-driver').textContent=g.driver;$('gpu-tu').textContent=(g.temp||'?')+'°C · '+(g.util||'0')+'%';
+   $('gpu-brands').innerHTML=/nvidia|geforce|rtx|gtx/i.test(g.name||'')?brand('nvidia','NVIDIA',g.name):(/radeon|amd/i.test(g.name||'')?brand('amd','AMD',g.name):'');}
  const dw=d.downloads||{}, sab=dw.sab||{}, qb=dw.qbit||{};
  $('dl-speed').textContent=((sab.speed_mbps||0)+(qb.dl_mbps||0)).toFixed(1);
  $('dl-sab').textContent=(sab.speed_mbps||0)+' Mbps · '+(sab.items||0)+' q'+(sab.status?(' ('+sab.status+')'):'');
@@ -313,16 +355,20 @@ async function load(){
  // gpu note
  const rec=(u.nvidia_recommended||''); $('gpu-note').textContent=(rec&&g.driver&&rec.indexOf(g.driver.split('.')[0])<0)?('newer: '+rec):'';
  // containers
- const tb=document.querySelector('#tbl tbody');tb.innerHTML='';
+ const til=$('tiles');
  const cs=(d.containers||[]).slice().sort((a,b)=>(b.update-a.update)||a.name.localeCompare(b.name));
  $('cont-count').textContent='· '+cs.length+' running · '+cs.filter(c=>c.update).length+' updates';
- cs.forEach(c=>{const tr=document.createElement('tr');
+ til.innerHTML=cs.map(function(c){
   const running=(c.status||'').toLowerCase().startsWith('up');
-  const st=c.update?'<span class="badge b-up">update</span>':'<span class="badge b-ok">ok</span>';
+  const bdg=c.update?'<span class="badge b-up">update</span>':'<span class="badge b-ok">ok</span>';
   const ub=c.update?'<button class=sm onclick="upd(\''+c.name+'\',this)">Update</button> ':'';
-  tr.innerHTML='<td>'+dot(running?'ok':'bad')+c.name+'</td><td><small>'+c.status+'</small></td><td>'+st+'</td>'+
-   '<td style=text-align:right>'+ub+'<button class=sm onclick="rst(\''+c.name+'\',this)">Restart</button> <button class=sm onclick="lg(\''+c.name+'\')">Logs</button></td>';
-  tb.appendChild(tr);});
+  return '<div class="tile'+(c.update?' upd':(running?'':' down'))+'">'+
+   '<div class=tname>'+dot(running?'ok':'bad')+c.name+'</div>'+
+   '<div class=tstat>'+c.status+'</div>'+
+   '<div style=margin-bottom:8px>'+bdg+'</div>'+
+   '<div class=tacts>'+ub+'<button class=sm onclick="rst(\''+c.name+'\',this)">Restart</button> <button class=sm onclick="lg(\''+c.name+'\')">Logs</button></div>'+
+   '</div>';
+ }).join('');
  // backups
  const bt=document.querySelector('#bktbl tbody');bt.innerHTML='';const bk=d.backups||[];
  $('bk-count').textContent='· '+bk.length;
