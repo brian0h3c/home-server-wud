@@ -41,12 +41,25 @@ which have a newer image. Each one gets a manual **Update** button.
 
 ## Control panel (Backup now / Update buttons)
 
-A second small UI at **http://<your-server-ip>:4013** gives you buttons:
+A second small UI at **http://<your-server-ip>:4013** is a **server command
+center** — at-a-glance cards for **System** (OS, kernel, uptime, CPU, RAM, disk),
+**NAS** (mounted + free space), **VPN** (connected + exit IP), **GPU/drivers**,
+plus **OS + container updates** and a **backups list** — with buttons:
 
-- **Full backup** — runs a full-stack backup (see below)
+- **Back up now** — runs a full-stack backup (see below)
 - **Update OS** — applies available host OS updates (opt-in, see below)
 - **Update** — per container: **backs up, then pulls + recreates** it
-- Live view of which containers have updates + the OS update count / reboot flag
+
+Host stats (System/NAS/VPN/GPU) come from `scripts/server-status.sh`, run every
+1-2 minutes by cron; the panel reads its JSON and shows the live container +
+backup lists itself. Install the collector cron with your paths, e.g.:
+
+```bash
+crontab -e
+*/2 * * * * STATUS_JSON=/home/me/docker/logs/server-status.json \
+  NAS_PATH=/mnt/nas OS_SNAP=/home/me/docker/logs/os-updates-latest.txt \
+  /path/to/scripts/server-status.sh >/dev/null 2>&1
+```
 
 Point `PROJECT_DIR` in `.env` at your stack (e.g. `/home/me/docker`) — it's
 mounted at the same path inside the panel so `docker compose` resolves your
