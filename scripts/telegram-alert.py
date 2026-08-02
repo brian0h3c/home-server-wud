@@ -99,6 +99,71 @@ def docker_containers():
     return rows
 
 
+def _wud_url():
+    """WUD's port is deliberately unpublished, so reach it on its bridge IP."""
+    try:
+        p = subprocess.run(
+            ["docker", "inspect", "-f",
+             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", "wud"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    ip = p.stdout.strip()
+    return "http://%s:3000/api/containers" % ip if ip else ""
+
+
+def registry_updates():
+    """Containers WUD reports as having a newer image published upstream."""
+    url = _wud_url()
+    if not url:
+        return []
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.load(r)
+    except Exception:  # noqa: BLE001
+        return []
+    return [c["name"] for c in data if c.get("updateAvailable") and c.get("name")]
+
+
+def unapplied_images():
+    """Containers running an image older than the tag they were created from.
+
+    Docker rewrites .Config.Image to a bare ID once that tag moves to a newer
+    image, so a hex-only reference is itself proof the container is behind.
+    This is the case WUD cannot see: it stops watching ID-referenced containers.
+    """
+    out = []
+    try:
+        p = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:  # noqa: BLE001
+        return out
+    for name in p.stdout.split():
+        try:
+            q = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Image}}|{{.Config.Image}}", name],
+                capture_output=True, text=True, timeout=15,
+            )
+            running_id, ref = q.stdout.strip().split("|", 1)
+        except Exception:  # noqa: BLE001
+            continue
+        if re.fullmatch(r"(sha256:)?[0-9a-f]{12,64}", ref):
+            out.append(name)
+            continue
+        try:
+            t = subprocess.run(
+                ["docker", "images", "--no-trunc", "--format", "{{.ID}}", ref],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        tag_id = (t.stdout.splitlines() or [""])[0].strip()
+        if tag_id and tag_id != running_id:
+            out.append(name)
+    return out
+
+
 d = load(STATUS_JSON, {})
 if not d:
     raise SystemExit(0)
@@ -138,6 +203,16 @@ for disk in d.get("disks", []):
     pu = disk.get("pct_used")
     if isinstance(pu, (int, float)) and pu >= 90:
         issues["wear_" + disk["name"]] = f"🟠 Disk <b>{disk['name']}</b> wear at <b>{pu}%</b>"
+
+for _n in registry_updates():
+    issues["img_" + _n] = f"\U0001F535 <b>{_n}</b>: a newer image is published upstream"
+_stale = unapplied_images()
+if _stale:
+    # grouped into one key so nine stale containers do not send nine messages
+    issues["stale_images"] = (
+        "\U0001F535 <b>%d container(s)</b> running an image older than the one already "
+        "pulled: <b>%s</b>" % (len(_stale), ", ".join(sorted(_stale)))
+    )
 
 prev = load(STATE, {})
 prev_keys = set(prev.keys()) if isinstance(prev, dict) else set()
