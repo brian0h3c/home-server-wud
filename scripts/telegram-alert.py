@@ -12,6 +12,7 @@ spammed every run.
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -78,6 +79,26 @@ def load(path, default):
         return default
 
 
+def docker_containers():
+    """Live docker state: server-status.json has no containers key (the panel
+    injects that per request, so it never reaches this script)."""
+    try:
+        p = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}|{{.Status}}"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    if p.returncode != 0:
+        return []
+    rows = []
+    for ln in p.stdout.splitlines():
+        if "|" in ln:
+            name, st = ln.split("|", 1)
+            rows.append({"name": name.strip(), "status": st.strip()})
+    return rows
+
+
 d = load(STATUS_JSON, {})
 if not d:
     raise SystemExit(0)
@@ -105,7 +126,7 @@ if d.get("updates", {}).get("reboot"):
     issues["reboot"] = "🟠 A <b>reboot is required</b> (kernel/firmware update)"
 if d.get("updates", {}).get("os_security", 0) > 0:
     issues["os_sec"] = f"🟠 <b>{d['updates']['os_security']} security update(s)</b> available"
-for c in d.get("containers", []):
+for c in docker_containers():
     if not str(c.get("status", "")).lower().startswith("up"):
         issues["cont_" + c["name"]] = f"🔴 Container <b>{c['name']}</b> is down ({c.get('status','?')})"
 for s in d.get("services", []):
