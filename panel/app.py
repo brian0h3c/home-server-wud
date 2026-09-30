@@ -131,7 +131,14 @@ def status():
     st["backups"] = list_backups()
     try:
         with open(OS_RUNLOG, encoding="utf-8", errors="replace") as f:
-            st["os_runlog"] = "\n".join(f.read().splitlines()[-30:])
+            lines = f.read().splitlines()
+        # the log is cumulative, so show only the newest run instead of a blind tail
+        starts = [i for i, ln in enumerate(lines) if "OS update requested" in ln]
+        run = lines[starts[-1]:] if starts else lines
+        if len(run) > 300:  # always keep line 0 so the run's start timestamp survives
+            trimmed = len(run) - 299
+            run = run[:1] + ["... %d earlier lines trimmed ..." % trimmed] + run[-298:]
+        st["os_runlog"] = "\n".join(run)
     except Exception:  # noqa: BLE001
         st["os_runlog"] = ""
     st["os_pending"] = os.path.exists(OS_FLAG)
@@ -658,8 +665,8 @@ async function load(){
  $('os-line').textContent=(u.os_count>0)?(u.os_count+' OS update(s)'+(u.os_security>0?' · '+u.os_security+' security':'')):'up to date';
  const bo=$('btn-os'); bo.disabled=d.os_pending||!(u.os_count>0); if(d.os_pending)$('os-line').textContent='OS update running…';
  $('reboot').innerHTML=(u.reboot?'<span class="badge b-bad">&#9888; reboot required</span> ':'')+(d.reboot_pending?'<span class="badge b-up">rebooting…</span>':'');
- $('os-run').textContent=d.os_runlog||'(nothing yet)';
- const op=(d.os_runlog||'').match(/Progress:\s*(\d+)%/);setbar('osbar',op?parseInt(op[1]):0,101,102);
+ const orn=$('os-run'); orn.textContent=d.os_runlog||'(nothing yet)'; orn.scrollTop=orn.scrollHeight;
+ const op=(d.os_runlog||'').match(/Progress:\s*(\d+)%/g);setbar('osbar',op?parseInt(op[op.length-1].match(/\d+/)[0]):0,101,102);
  $('gpu-note').textContent=g.present?((g.mem_used||0)+' / '+(g.mem_total||0)+' MiB VRAM'):'';
  // containers
  const til=$('tiles');
