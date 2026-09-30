@@ -107,12 +107,31 @@ def dmi(name):
 
 
 cpu_model = ""
-for line in read("/proc/cpuinfo").splitlines():
+cpuinfo = read("/proc/cpuinfo")
+for line in cpuinfo.splitlines():
     if line.lower().startswith("model name"):
         cpu_model = line.split(":", 1)[1].strip()
         break
+core_ids = set()
+for block in cpuinfo.split("\n\n"):
+    physical = re.search(r"^physical id\s*:\s*(\d+)", block, re.M)
+    core = re.search(r"^core id\s*:\s*(\d+)", block, re.M)
+    if core:
+        core_ids.add((physical.group(1) if physical else "0", core.group(1)))
+max_freq = read("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").strip()
+disks = []
+for path in sorted(glob.glob("/sys/block/nvme*") + glob.glob("/sys/block/sd*")):
+    sectors = read(f"{path}/size").strip()
+    model = read(f"{path}/device/model").strip()
+    if sectors.isdigit():
+        disks.append({"name": os.path.basename(path), "model": model,
+                      "size_gb": round(int(sectors) * 512 / 1e9)})
 hw = {"vendor": dmi("sys_vendor"), "board": dmi("board_name"),
-      "product": dmi("product_name"), "bios": dmi("bios_version"), "cpu": cpu_model}
+      "board_version": dmi("board_version"), "product": dmi("product_name"),
+      "bios": dmi("bios_version"), "bios_date": dmi("bios_date"), "cpu": cpu_model,
+      "cpu_cores": len(core_ids) or ncpu, "cpu_threads": ncpu,
+      "cpu_max_ghz": round(int(max_freq) / 1e6, 1) if max_freq.isdigit() else None,
+      "disks": disks}
 
 # ---------- network (rate via delta) ----------
 iface = ""
@@ -124,6 +143,10 @@ for line in run(["ip", "route"]).splitlines():
             break
 net = {"iface": iface, "rx_mbps": 0, "tx_mbps": 0}
 if iface:
+    ls = read(f"/sys/class/net/{iface}/speed").strip()
+    net["link_mbps"] = int(ls) if ls.lstrip("-").isdigit() and int(ls) > 0 else None
+    driver = os.path.realpath(f"/sys/class/net/{iface}/device/driver")
+    net["driver"] = os.path.basename(driver) if driver else ""
     rx = int(read(f"/sys/class/net/{iface}/statistics/rx_bytes").strip() or 0)
     tx = int(read(f"/sys/class/net/{iface}/statistics/tx_bytes").strip() or 0)
     now = time.time()
@@ -154,19 +177,21 @@ if gl:
            "mem_used": p[4] if len(p) > 4 else "", "mem_total": p[5] if len(p) > 5 else ""}
 
 # ---------- VPN ----------
-vpn = {"health": run(["docker", "inspect", "-f",
-       "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", VPNC]) or "absent"}
+vpn = {"health": "disabled"}
 ip = ""
-try:
-    j = subprocess.run(["docker", "exec", VPNC, "wget", "-qO-", "-T", "6",
-                        "http://127.0.0.1:8000/v1/publicip/ip"], capture_output=True, text=True, timeout=10).stdout
-    ip = (json.loads(j).get("public_ip", "") if j.strip().startswith("{") else "")
-except Exception:  # noqa: BLE001
-    ip = ""
-if not ip:
+if VPNC:
+    vpn["health"] = run(["docker", "inspect", "-f",
+        "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", VPNC]) or "absent"
+    try:
+        j = subprocess.run(["docker", "exec", VPNC, "wget", "-qO-", "-T", "6",
+                            "http://127.0.0.1:8000/v1/publicip/ip"], capture_output=True, text=True, timeout=10).stdout
+        ip = (json.loads(j).get("public_ip", "") if j.strip().startswith("{") else "")
+    except Exception:  # noqa: BLE001
+        ip = ""
+if VPNC and not ip:
     ip = run(["docker", "exec", VPNC, "wget", "-qO-", "-T", "6", "https://api.ipify.org"], t=10)
 vpn["exit_ip"] = ip
-vpn["port"] = run(["docker", "exec", VPNC, "cat", "/tmp/gluetun/forwarded_port"])
+vpn["port"] = run(["docker", "exec", VPNC, "cat", "/tmp/gluetun/forwarded_port"]) if VPNC else ""
 
 # ---------- Plex now playing ----------
 plex = {"configured": bool(PLEX_PREF), "sessions": []}
@@ -225,12 +250,6 @@ if OS_SNAP:
     osc = int(mc.group(1)) if mc else 0
     oss = int(ms.group(1)) if ms else 0
 reboot = os.path.exists("/var/run/reboot-required")
-nvrec = ""
-for line in run(["ubuntu-drivers", "devices"]).splitlines():
-    if "recommended" in line:
-        mm = re.search(r"(nvidia-driver-\S+)", line)
-        if mm:
-            nvrec = mm.group(1)
 
 # ---------- service health (probe each quick link) ----------
 def probe(url, t=4):
@@ -295,7 +314,7 @@ data = {
     "services": services,
     "media": media,
     "disks": disks,
-    "updates": {"os_count": osc, "os_security": oss, "reboot": reboot, "nvidia_recommended": nvrec},
+    "updates": {"os_count": osc, "os_security": oss, "reboot": reboot},
 }
 tmp = OUT + ".tmp"
 open(tmp, "w").write(json.dumps(data, indent=1))

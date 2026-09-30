@@ -4,3 +4,4 @@ backups/
 logs/
 *.tar.gz
 *.log
+nas-repair-notes.md

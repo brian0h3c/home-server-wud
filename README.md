@@ -4,16 +4,17 @@ A tiny, **plug-and-play update-management stack** for a self-hosted Docker box.
 
 It gives you:
 
-- 📊 **A dashboard** ([What's Up Docker / WUD](https://github.com/getwud/wud)) to **see which containers have image updates** and update them with **one click** — nothing auto-updates behind your back.
+- 📊 **A control panel** to see host status, OS updates, and container image drift, and update a container with **one click** — nothing auto-updates behind your back.
 - 💾 **`update.sh`** — a safe updater that **backs up a container's config *before* pulling the new image**, so you can always roll back.
 - �️ **`backup.sh`** — full-stack backup of your **compose folder + all app configs** (skips media/downloads/caches), with rotation, an **optional copy to a NAS/second location**, and **optional extra paths** (e.g. an exported NAS config).
 - 🖥️ **`os-update-check.sh`** — logs available **OS (apt) updates** daily so host updates are visible too.
 
 Everything is generic — no secrets, no hard-coded IPs. Clone, set a couple of env vars, and go.
 
-> **Heads-up:** WUD is an *image-update watcher* — it can't run shell/backup jobs
-> itself. So backups run three ways: **on a schedule** (cron), **on demand**
-> (`backup.sh`), and **automatically before an update** (`update.sh --full`).
+> **Heads-up:** the panel compares each running container with the image already
+> on disk. It does not scan registries. Backups run three ways: **on a schedule**
+> (cron), **on demand** (`backup.sh`), and **automatically before an update**
+> (`update.sh --full`).
 
 ---
 
@@ -27,21 +28,18 @@ Everything is generic — no secrets, no hard-coded IPs. Clone, set a couple of 
 ```bash
 git clone https://github.com/brian0h3c/home-server-wud.git
 cd home-server-wud
-cp .env.example .env          # edit TZ / WUD_PORT if you like
+cp .env.example .env          # edit TZ / PANEL_PORT if you like
 docker compose up -d
 ```
 
-Open the dashboard: **http://<your-server-ip>:4012**
-
-WUD scans all your running containers every 6 hours (configurable) and shows
-which have a newer image. Each one gets a manual **Update** button.
+Open the panel: **http://<your-server-ip>:4013**
 
 > Tip: for a home LAN, bind the port to your LAN IP so it isn't exposed —
-> set `WUD_PORT=192.168.1.10:4012` style by editing `docker-compose.yml`.
+> set `PANEL_PORT=192.168.1.10:4013` style by editing `docker-compose.yml`.
 
 ## Control panel (Backup now / Update buttons)
 
-A second small UI at **http://<your-server-ip>:4013** is a **server command
+The UI at **http://<your-server-ip>:4013** is a **server command
 center** — at-a-glance cards for **System** (OS, kernel, uptime, CPU, RAM, disk),
 **NAS** (mounted + free space), **VPN** (connected + exit IP), **GPU/drivers**,
 plus **OS + container updates** and a **backups list** — with buttons:
@@ -90,9 +88,8 @@ the host applies them, and surfaces the run log + a reboot-required flag.
 
 ## Safe updates with automatic backup
 
-WUD's one-click button recreates a container **without** a backup. For anything
-stateful (databases, *arr apps, etc.) use the wrapper instead — it snapshots the
-config first:
+The panel Update button uses this wrapper. It snapshots config before pulling
+and recreating, which matters for stateful apps (databases, *arr apps, etc.):
 
 ```bash
 ./scripts/update.sh sonarr            # backup -> pull -> recreate
@@ -181,18 +178,19 @@ Then just read `logs/os-updates-latest.txt`. Apply the updates yourself with
 
 ## Good to know / gotchas
 
-- **WUD watches container images only — not the OS.** That's what the OS script
-  is for.
+- **The panel does not watch OS packages.** That's what the OS script is for.
+- A container shows an update only when its running image differs from the tag
+  already pulled locally. Run `docker compose pull` before expecting the panel
+  to flag a newer registry image.
 - Some apps show an **in-app "update available"** that checks their GitHub, not
-  the Docker `:latest` tag. If `docker pull` says *"Image is up to date"*, WUD is
-  right and there's simply no newer **image** yet.
-- **Don't one-click-update fragile containers from the WUD UI** — e.g. anything
-  using a `tmpfs` transcode dir (Plex) or `network_mode: service:<vpn>`
-  (a torrent client behind a VPN). Update those with `./scripts/update.sh` or
-  `docker compose pull && docker compose up -d` so their special config is
+  the Docker `:latest` tag. If `docker pull` says *"Image is up to date"*, there
+  is simply no newer **image** yet.
+- **Be careful with fragile containers** — e.g. anything using a `tmpfs`
+  transcode dir (Plex) or `network_mode: service:<vpn>` (a torrent client behind
+  a VPN). Update those with `./scripts/update.sh` so their special config is
   preserved.
-- WUD needs the Docker socket (`/var/run/docker.sock`). Keep the dashboard on
-  your LAN, not the public internet.
+- The panel needs the Docker socket (`/var/run/docker.sock`). Keep it on your
+  LAN, not the public internet.
 
 ## License
 

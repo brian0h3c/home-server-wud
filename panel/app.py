@@ -13,10 +13,10 @@ import re
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-WUD_URL = os.environ.get("WUD_URL", "http://wud:3000")
 SCRIPTS = os.environ.get("SCRIPTS_DIR", "/app/scripts")
 LOGDIR = os.environ.get("LOG_DIR", "/app/logs")
 STATUS_JSON = os.environ.get("STATUS_JSON", os.path.join(LOGDIR, "server-status.json"))
@@ -26,10 +26,11 @@ REBOOT_FLAG = os.environ.get("REBOOT_FLAG", os.path.join(LOGDIR, ".reboot-reques
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backups")
 MEDIA_CONTAINER = os.environ.get("MEDIA_CONTAINER", "plexms")
 MEDIA_PATH = os.environ.get("MEDIA_TEST_PATH", "/media/Black/Movies")
-QBIT_URL = os.environ.get("QBIT_URL", "http://192.168.50.10:4009")
+QBIT_URL = os.environ.get("QBIT_URL", "")
 PLEX_PREF_FILE = os.environ.get("PLEX_PREF", "/plex/Preferences.xml")
 PLEX_URL = os.environ.get("PLEX_URL", "http://192.168.50.10:32400")
 HISTORY_DB = os.environ.get("HISTORY_DB", os.path.join(LOGDIR, "history.db"))
+ACTION_LOG = os.environ.get("ACTION_LOG", os.path.join(LOGDIR, "panel-actions.log"))
 QUICK_LINKS = os.environ.get("QUICK_LINKS", "[]")
 TOKEN = os.environ.get("PANEL_TOKEN", "")
 PORT = int(os.environ.get("PANEL_PORT", "8080"))
@@ -65,13 +66,36 @@ def container_stats():
     return m
 
 
-def wud_updates():
+def local_updates(containers):
+    names = [c["name"] for c in containers]
+    if not names:
+        return {}
     try:
-        with urllib.request.urlopen(WUD_URL + "/api/containers", timeout=8) as r:
-            data = json.load(r)
-        return {c.get("name"): bool(c.get("updateAvailable")) for c in data}
+        _, raw = sh(["docker", "inspect", *names], timeout=30)
+        details = json.loads(raw)
+        def normalized(ref):
+            leaf = ref.rsplit("/", 1)[-1]
+            return ref if "@" in ref or ":" in leaf else ref + ":latest"
+
+        refs = sorted({normalized(c["Config"]["Image"]) for c in details})
+        _, raw = sh(["docker", "image", "inspect", *refs], timeout=30)
+        tagged = {}
+        for image in json.loads(raw):
+            for tag in image.get("RepoTags") or []:
+                tagged[tag] = image["Id"]
+        return {c["Name"].lstrip("/"): c["Image"] != tagged.get(normalized(c["Config"]["Image"]), c["Image"])
+                for c in details}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def log_action(action, target, rc, output):
+    try:
+        with open(ACTION_LOG, "a", encoding="utf-8") as f:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"===== {stamp} {action} {target} rc={rc} =====\n{output.rstrip()}\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def read_json(path):
@@ -99,10 +123,11 @@ def list_backups(limit=15):
 
 def status():
     st = read_json(STATUS_JSON)
-    ups = wud_updates()
     stats = container_stats()
-    st["containers"] = [{**c, "update": ups.get(c["name"], False), **stats.get(c["name"], {})}
-                        for c in running_containers()]
+    containers = running_containers()
+    local = local_updates(containers)
+    st["containers"] = [{**c, "update": local.get(c["name"], False),
+                         **stats.get(c["name"], {})} for c in containers]
     st["backups"] = list_backups()
     try:
         with open(OS_RUNLOG, encoding="utf-8", errors="replace") as f:
@@ -187,6 +212,8 @@ def live():
     out["disk"] = {"r_mbps": round((d2[0] - d1[0]) / dt / 1e6, 2),
                    "w_mbps": round((d2[1] - d1[1]) / dt / 1e6, 2)}
     try:
+        if not QBIT_URL:
+            return out
         with urllib.request.urlopen(QBIT_URL + "/api/v2/transfer/info", timeout=2) as r:
             qb = json.load(r)
         out["qbit"] = {"dl_mbps": round(qb.get("dl_info_speed", 0) * 8 / 1e6, 2),
@@ -199,26 +226,44 @@ def live():
 def speedtest():
     res = {"down": 0, "up": 0}
     ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) command-center/1.0"}
+    streams = 6
+
+    def dl(_):
+        try:
+            req = urllib.request.Request("https://speed.cloudflare.com/__down?bytes=100000000", headers=ua)
+            n = 0
+            with urllib.request.urlopen(req, timeout=30) as r:
+                while True:
+                    b = r.read(131072)
+                    if not b:
+                        break
+                    n += len(b)
+            return n
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def ul(_):
+        try:
+            payload = b"0" * 25_000_000
+            req = urllib.request.Request("https://speed.cloudflare.com/__up", data=payload,
+                                         method="POST", headers=ua)
+            urllib.request.urlopen(req, timeout=30)
+            return len(payload)
+        except Exception:  # noqa: BLE001
+            return 0
+
     try:
         t = time.time()
-        n = 0
-        req = urllib.request.Request("https://speed.cloudflare.com/__down?bytes=25000000", headers=ua)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            while True:
-                b = r.read(65536)
-                if not b:
-                    break
-                n += len(b)
-        res["down"] = round(n * 8 / max(time.time() - t, 0.1) / 1e6, 1)
+        with ThreadPoolExecutor(max_workers=streams) as ex:
+            got = sum(ex.map(dl, range(streams)))
+        res["down"] = round(got * 8 / max(time.time() - t, 0.1) / 1e6, 1)
     except Exception:  # noqa: BLE001
         pass
     try:
-        payload = b"0" * 10_000_000
         t = time.time()
-        req = urllib.request.Request("https://speed.cloudflare.com/__up", data=payload,
-                                     method="POST", headers=ua)
-        urllib.request.urlopen(req, timeout=30)
-        res["up"] = round(len(payload) * 8 / max(time.time() - t, 0.1) / 1e6, 1)
+        with ThreadPoolExecutor(max_workers=streams) as ex:
+            got = sum(ex.map(ul, range(streams)))
+        res["up"] = round(got * 8 / max(time.time() - t, 0.1) / 1e6, 1)
     except Exception:  # noqa: BLE001
         pass
     return res
@@ -288,6 +333,8 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
  .sub{color:var(--mut);font-size:12px;margin-top:2px}
  .kv{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
  .kv .k{color:var(--mut)} .kv .v{font-family:ui-monospace,monospace}
+ .hwcard .big{font-size:15px;line-height:1.35;overflow-wrap:anywhere;margin-bottom:5px}
+ .hwcard .kv{gap:10px}.hwcard .kv .v{text-align:right;max-width:68%;overflow-wrap:anywhere}
  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;vertical-align:middle}
  .d-ok{background:var(--green);box-shadow:0 0 8px var(--green)} .d-warn{background:var(--amber);box-shadow:0 0 8px var(--amber)}
  .d-bad{background:var(--red);box-shadow:0 0 8px var(--red);animation:blink 1.1s infinite} .d-mut{background:var(--mut)}
@@ -414,11 +461,21 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <div class=kv style=margin-top:6px><span class=k>Disk I/O</span><span class=v id=sys-io>&mdash;</span></div>
       <svg class=spark id=sp-disk viewBox="0 0 100 34" preserveAspectRatio=none></svg>
     </div>
+        <div class="card hwcard"><h3>&#128421; Hardware</h3>
+            <div class=big id=hw-cpu>&ndash;</div>
+            <div class=kv><span class=k>topology</span><span class=v id=hw-topology></span></div>
+            <div class=kv><span class=k>memory</span><span class=v id=hw-memory></span></div>
+            <div class=kv><span class=k>motherboard</span><span class=v id=hw-board></span></div>
+            <div class=kv><span class=k>BIOS</span><span class=v id=hw-bios></span></div>
+            <div class=kv><span class=k>system drive</span><span class=v id=hw-disk></span></div>
+            <div class=kv><span class=k>network</span><span class=v id=hw-network></span></div>
+        </div>
     <div class=card><h3>&#128225; Network <span class=live></span></h3>
       <div class=big id=net-dn>&ndash;</div><div class=sub>download Mbps &middot; <span id=net-up></span> up</div>
       <svg class=spark id=sp-net viewBox="0 0 100 34" preserveAspectRatio=none></svg>
       <div class=kv><span class=k>interface</span><span class=v id=net-if></span></div>
-      <div class=kv><span class=k>internet</span><span class=v id=speed-res>&mdash;</span></div>
+      <div class=kv><span class=k>link speed</span><span class=v id=net-link>&mdash;</span></div>
+      <div class=kv><span class=k>internet (WAN)</span><span class=v id=speed-res>&mdash;</span></div>
       <button class=sm style=margin-top:6px onclick="doSpeedtest(this)">Speed test</button>
     </div>
     <div class=card><h3>&#128190; NAS storage</h3>
@@ -471,9 +528,10 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
       <button class=warn id=btn-os onclick="doOsUpdate(this)">&#11014; Update OS</button>
       <span id=os-line class=mut></span>
     </div>
+        <div class=bar id=osbar style="margin-top:10px"><span></span></div>
     <div id=reboot style=margin-top:9px></div>
     <pre id=out style=display:none></pre>
-    <details><summary>OS update run log</summary><pre id=os-run>&ndash;</pre></details>
+    <details open><summary>OS update summary</summary><pre id=os-run>&ndash;</pre></details>
   </div>
 
   <div class=sec>
@@ -527,6 +585,7 @@ function spark(id,series){const el=$(id);if(!el)return;const W=100,H=34;
  el.innerHTML=html;}
 const fmt=v=>v>=1?v.toFixed(1):v.toFixed(2);
 async function live(){
+ if(document.hidden)return;
  let d;try{d=await(await fetch('/api/live'+qs)).json();}catch(e){return;}
  pushv('rx',d.net.rx_mbps);pushv('tx',d.net.tx_mbps);pushv('cpu',d.cpu);
  pushv('dr',d.disk.r_mbps);pushv('dw',d.disk.w_mbps);
@@ -550,6 +609,12 @@ async function load(){
  $('sys-os').textContent=s.os||'—'; $('sys-kernel').textContent='kernel '+(s.kernel||'?');
  const hw=s.hw||{};
  $('sys-brands').innerHTML=[].concat(brandsFor((hw.board||'')+' '+(hw.vendor||'')),brandsFor(hw.cpu||'')).join('');
+ $('hw-cpu').textContent=(hw.cpu||'—').replace(/\s*@.*$/,'');
+ $('hw-topology').textContent=(hw.cpu_cores||'?')+' cores / '+(hw.cpu_threads||s.ncpu||'?')+' threads'+(hw.cpu_max_ghz?' · '+hw.cpu_max_ghz+' GHz':'');
+ $('hw-memory').textContent=((s.mem_total_mb||0)/1024).toFixed(1)+' GB';
+ $('hw-board').textContent=[hw.vendor,hw.board,hw.board_version].filter(Boolean).join(' · ')||'—';
+ $('hw-bios').textContent=[hw.bios,hw.bios_date].filter(Boolean).join(' · ')||'—';
+ const hd=(hw.disks||[])[0]||{};$('hw-disk').textContent=[hd.model,hd.size_gb?(hd.size_gb+' GB'):null].filter(Boolean).join(' · ')||'—';
  $('sys-uptime').textContent=s.uptime||'?';
  const nc=s.ncpu||1, cp=Math.round((parseFloat(s.load||0)/nc)*100);
  $('sys-load').textContent=(s.load||'?')+' ('+cp+'%)';
@@ -558,14 +623,17 @@ async function load(){
  $('sys-mem').textContent=(mu/1024).toFixed(1)+'/'+(mt/1024).toFixed(1)+' GB'; setbar('membar',Math.round(mu/mt*100),75,90);
  $('sys-disk').textContent=(s.disk_root_pct||'?')+' · '+(s.disk_root_free||'?')+' free';
  const nt=d.net||{}; $('net-dn').textContent=(nt.rx_mbps||0); $('net-up').textContent=(nt.tx_mbps||0)+' Mbps'; $('net-if').textContent=nt.iface||'—';
+ $('net-link').textContent=nt.link_mbps?((nt.link_mbps>=1000?(nt.link_mbps/1000)+' Gbps':nt.link_mbps+' Mbps')):'—';
+ $('hw-network').textContent=[nt.iface,nt.driver,nt.link_mbps?(nt.link_mbps>=1000?(nt.link_mbps/1000)+' Gbps':nt.link_mbps+' Mbps'):null].filter(Boolean).join(' · ')||'—';
  const n=d.nas||{};
  if(!n.configured){$('nas-state').innerHTML=dot('mut')+'n/a';}
  else if(n.mounted){$('nas-state').innerHTML=dot('ok')+'Mounted';$('nas-sub').textContent=(n.used||'?')+' / '+(n.total||'?')+' · '+(n.free||'?')+' free';setbar('nasbar',parseInt(n.used_pct)||0,85,95);}
  else{$('nas-state').innerHTML=dot('bad')+'NOT mounted';$('nas-sub').textContent='auto-remounts within ~3 min';}
  const v=d.vpn||{}, up=(v.health==='healthy'||v.health==='running');
- $('vpn-state').innerHTML=up?dot('ok')+'Connected':dot('bad')+(v.health||'down');
+ const vd=v.health==='disabled';
+ $('vpn-state').innerHTML=vd?dot('mut')+'Disabled':(up?dot('ok')+'Connected':dot('bad')+(v.health||'down'));
  $('vpn-ip').textContent=v.exit_ip||'—'; $('vpn-port').textContent=v.port||'—';
- $('vpn-note').textContent=up?'torrents exit via VPN, not home IP':'kill-switch: torrents blocked until VPN is back';
+ $('vpn-note').textContent=vd?'Usenet only · torrent services stopped':(up?'torrents exit via VPN, not home IP':'kill-switch: torrents blocked until VPN is back');
  const g=d.gpu||{};
  if(!g.present){$('gpu-name').textContent='none';$('gpu-driver').textContent='—';$('gpu-tu').textContent='—';$('gpu-brands').innerHTML='';}
  else{$('gpu-name').textContent=g.name;$('gpu-driver').textContent=g.driver;$('gpu-tu').textContent=(g.temp||'?')+'°C · '+(g.util||'0')+'%';
@@ -591,8 +659,8 @@ async function load(){
  const bo=$('btn-os'); bo.disabled=d.os_pending||!(u.os_count>0); if(d.os_pending)$('os-line').textContent='OS update running…';
  $('reboot').innerHTML=(u.reboot?'<span class="badge b-bad">&#9888; reboot required</span> ':'')+(d.reboot_pending?'<span class="badge b-up">rebooting…</span>':'');
  $('os-run').textContent=d.os_runlog||'(nothing yet)';
- // gpu note
- const rec=(u.nvidia_recommended||''); $('gpu-note').textContent=(rec&&g.driver&&rec.indexOf(g.driver.split('.')[0])<0)?('newer: '+rec):'';
+ const op=(d.os_runlog||'').match(/Progress:\s*(\d+)%/);setbar('osbar',op?parseInt(op[1]):0,101,102);
+ $('gpu-note').textContent=g.present?((g.mem_used||0)+' / '+(g.mem_total||0)+' MiB VRAM'):'';
  // containers
  const til=$('tiles');
  const cs=(d.containers||[]).slice().sort((a,b)=>(b.update-a.update)||a.name.localeCompare(b.name));
@@ -629,7 +697,7 @@ async function load(){
  function arrRow(name,a){return a?('<div class=drow><span>'+name+'</span><span class=v>'+(a.queue||0)+' queue · '+(a.missing||0)+' missing</span></div>'):('<div class=drow><span>'+name+'</span><span class=mut>offline</span></div>');}
  $('media').innerHTML=arrRow('Radarr (movies)',md.radarr)+arrRow('Sonarr (TV)',md.sonarr);
 }
-async function post(path){return (await fetch(path+qs,{method:'POST'})).text();}
+async function post(path){const r=await fetch(path+qs,{method:'POST'}),t=await r.text();if(!r.ok)throw new Error(t||('HTTP '+r.status));return t;}
 async function doBackup(b){busy(b,true,'backing up');showout('Running full backup…');try{showout(await post('/backup'));toast('backup done');}catch(e){showout(''+e);}finally{busy(b,false);load();}}
 async function doOsUpdate(b){if(!confirm('Apply OS updates now? Docker may briefly restart.'))return;busy(b,true,'…');try{showout(await post('/os-update'));toast('OS update requested');}catch(e){showout(''+e);}finally{busy(b,false);setTimeout(load,1500);}}
 async function doReboot(b){if(!confirm('Reboot the whole server now?'))return;busy(b,true,'…');try{showout(await post('/reboot'));toast('reboot requested');}catch(e){showout(''+e);}finally{busy(b,false);setTimeout(load,1500);}}
@@ -649,9 +717,14 @@ async function loadHist(){
  $('hist').innerHTML=S.map((s,i)=>'<div class=hbox><h4>'+s.t+'</h4><div class=hv id=hv'+i+'>–</div><svg class="hchart '+s.c+'" id=hc'+i+' viewBox="0 0 100 54" preserveAspectRatio=none></svg></div>').join('');
  S.forEach(function(s,i){const a=rows.map(r=>+r[idx[s.k]]||0);if(!a.length)return;$('hv'+i).textContent=a[a.length-1]+(s.u?(' '+s.u):'');drawChart('hc'+i,a);});
 }
-load();setInterval(load,20000);
-live();setInterval(live,2000);
-loadHist();setInterval(loadHist,60000);
+let liveTimer;
+async function liveLoop(){if(document.hidden)return;await live();if(!document.hidden)liveTimer=setTimeout(liveLoop,2000);}
+function visibleLoad(){if(!document.hidden)load();}
+function visibleHistory(){if(!document.hidden)loadHist();}
+document.addEventListener('visibilitychange',function(){if(document.hidden){clearTimeout(liveTimer);return;}load();loadHist();liveLoop();});
+load();setInterval(visibleLoad,20000);
+liveLoop();
+loadHist();setInterval(visibleHistory,60000);
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(function(){});}
 </script></body></html>"""
 
@@ -769,8 +842,9 @@ class Handler(BaseHTTPRequestHandler):
             name = q.get("name", [""])[0]
             if name not in names:
                 return self._send(400, "unknown container", "text/plain")
-            _, out = sh([os.path.join(SCRIPTS, "update.sh"), name])
-            return self._send(200, out, "text/plain")
+            rc, out = sh([os.path.join(SCRIPTS, "update.sh"), name])
+            log_action("update", name, rc, out)
+            return self._send(200 if rc == 0 else 500, out, "text/plain")
         if u.path == "/restart":
             name = q.get("name", [""])[0]
             if name not in names:

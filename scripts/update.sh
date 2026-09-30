@@ -7,9 +7,8 @@
 #   2. pull the new image
 #   3. recreate the container
 #
-# This is the SAFE way to apply updates that WUD shows are available: WUD's
-# built-in one-click button recreates a container WITHOUT a backup, so for any
-# stateful app (databases, *arr apps, Plex, etc.) use this script instead.
+# The panel Update button calls this script. It snapshots config before pulling
+# and recreating, which matters for stateful apps (databases, *arr apps, Plex).
 #
 # Usage:
 #   ./scripts/update.sh <container> [<container> ...]
@@ -69,6 +68,31 @@ backup_container() {
     echo "  [!] no such container: $name"; return 1
   fi
   mkdir -p "$BACKUP_DIR"
+  if [ "$name" = "plexms" ]; then
+    local config_src db_dir manifest ts out file
+    config_src="$(docker inspect "$name" --format '{{range .Mounts}}{{if eq .Destination "/config"}}{{.Source}}{{end}}{{end}}')"
+    [ -n "$config_src" ] || { echo "  [!] Plex /config mount not found"; return 1; }
+    db_dir="$config_src/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+    ts="$(date +%Y%m%d_%H%M%S)"
+    out="$BACKUP_DIR/${name}_${ts}.tar.gz"
+    manifest="$(mktemp)"
+    printf '%s\0' "Library/Application Support/Plex Media Server/Preferences.xml" > "$manifest"
+    while IFS= read -r -d '' file; do
+      printf '%s\0' "${file#"$config_src"/}" >> "$manifest"
+    done < <(find "$db_dir" -maxdepth 1 -type f ! -name '*-20??-??-??' -print0)
+    echo "  backing up Plex preferences + databases"
+    echo "          -> $out"
+    if ! tar -C "$config_src" --null -T "$manifest" -czf "$out"; then
+      rm -f "$manifest"
+      rm -f "$out"
+      echo "  [!] backup failed"
+      return 1
+    fi
+    rm -f "$manifest"
+    ls -1t "$BACKUP_DIR/${name}_"*.tar.gz 2>/dev/null | tail -n +"$((KEEP + 1))" | xargs -r rm -f
+    echo "  backup ok ($(du -h "$out" | cut -f1))"
+    return 0
+  fi
   local srcs=()
   while IFS=$'\t' read -r dest src; do
     for d in $BACKUP_DESTS; do
@@ -94,12 +118,35 @@ backup_container() {
 
 update_one() {
   local name="$1"
+  local service ref running latest stopped=0
   echo "== $name =="
-  backup_container "$name" || { echo "  aborting: backup failed"; return 1; }
+  if [ "$name" = "plexms" ]; then
+    echo "  stopping Plex for a consistent database backup..."
+    docker stop -t 30 "$name" >/dev/null
+    stopped=1
+  fi
+  backup_container "$name" || {
+    [ "$stopped" = 0 ] || docker start "$name" >/dev/null
+    echo "  aborting: backup failed"; return 1;
+  }
+  service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$name" 2>/dev/null)"
+  [ -n "$service" ] || service="$name"
+  ref="$(docker inspect -f '{{.Config.Image}}' "$name")"
   echo "  pulling latest image..."
-  compose pull "$name" || { echo "  [!] pull failed (is '$name' the compose service name?)"; return 1; }
+  compose pull "$service" || {
+    [ "$stopped" = 0 ] || docker start "$name" >/dev/null
+    echo "  [!] pull failed for service '$service'"; return 1;
+  }
   echo "  recreating container..."
-  compose up -d "$name"
+  compose up -d "$service"
+  running="$(docker inspect -f '{{.Image}}' "$name")"
+  latest="$(docker image inspect -f '{{.Id}}' "$ref")"
+  [ "$running" = "$latest" ] || { echo "  [!] recreate completed but '$name' is still on the old image"; return 1; }
+  if [ "$name" = "plexms" ]; then
+    [ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/transcode"}}{{.Type}}{{end}}{{end}}' "$name")" = "tmpfs" ] || {
+      echo "  [!] Plex /transcode is not tmpfs after recreation"; return 1;
+    }
+  fi
   echo "  updated."
 }
 
